@@ -1,11 +1,16 @@
+import base64
+import json
 import math
 import os
 import random
+import re
 import struct
 import threading
 import time
 import tkinter as tk
+from dataclasses import dataclass
 from pathlib import Path
+from tkinter import filedialog
 
 try:
     from PIL import Image, ImageTk, ImageOps  # type: ignore
@@ -30,6 +35,79 @@ except ImportError:
     winsound = None
 
 
+@dataclass(frozen=True)
+class PetProfile:
+    id: str
+    name: str
+    editor_title: str
+    editor_intro_text: str
+    editor_chunks: tuple[str, ...]
+    # Chance to start typing random stuff while the prank "Notepad" window is open.
+    editor_typing_chance: float = 0.12
+
+
+PET_PROFILES: dict[str, PetProfile] = {
+    "cube": PetProfile(
+        id="cube",
+        name="CubePet",
+        editor_title="annoying_editor.txt - Notepad",
+        editor_intro_text=(
+            "HEHEHEHA\n\n"
+            "ich zieh den editor einfach von der seite rein.\n"
+            "du tippst? nein, ich tippe.\n"
+        ),
+        editor_chunks=(
+            "Halllllo ",
+            "HEHEHEHA ",
+            "lol ",
+            "du kannst nix machen ",
+            "hehe ",
+            "hmmmm ",
+        ),
+        editor_typing_chance=0.22,
+    ),
+    "aki": PetProfile(
+        id="aki",
+        name="Aki",
+        editor_title="aki_notes.txt - Notepad",
+        editor_intro_text=(
+            "Aki\n\n"
+            "wenn du ne text datei offen hast...\n"
+            "schreib ich random kacke rein.\n"
+            "fuetter mich mit daten.\n"
+        ),
+        editor_chunks=(
+            "aki sagt: ",
+            "kacke ",
+            "hehe ",
+            "gib daten ",
+            "lol ",
+            "du tippst? ich tippe. ",
+        ),
+        editor_typing_chance=0.35,
+    ),
+    "pamuk": PetProfile(
+        id="pamuk",
+        name="Pamuk",
+        editor_title="pamuk_devstuff.txt - Notepad",
+        editor_intro_text=(
+            "PamukDevStuff\n\n"
+            "fuettern mit daten.\n"
+            "mach mal ne text datei auf.\n"
+        ),
+        editor_chunks=(
+            "pamuk: ",
+            "daten pls ",
+            "HEHEHEHA ",
+            "random ",
+            "hmm ",
+            "du kannst nix machen ",
+        ),
+        editor_typing_chance=0.25,
+    ),
+}
+
+
 class AnnoyingBlockPet:
     def __init__(self) -> None:
         # Config via environment variables:
@@ -44,9 +122,15 @@ class AnnoyingBlockPet:
         # - CUBEPET_DISCORD_RPC_CLIENT_ID=... required for Discord RPC
         # - CUBEPET_DEBUG=1 enables extra logging to cubepet.log (default off)
         # - CUBEPET_HORROR_GAME=0 disables the hidden horror mini-game (default on)
+        # - CUBEPET_PROFILE=cube|aki|pamuk selects the pet profile (default cube)
+        # - CUBEPET_SELECT_PET=1 shows the options window on startup (default off)
+        # - CUBEPET_HUNGER=1 enables the hunger bar + feeding (default off)
+        # - CUBEPET_HUNGER_FULL_S=900 seconds to drain from full->empty (default 900)
+        # - CUBEPET_EDITOR_MISCHIEF=1 makes the prank editor type more often (default off)
         self.asset_dir = Path(__file__).resolve().parent
         self.log_path = self.asset_dir / "cubepet.log"
         self.image_cache_path = self.asset_dir / ".image_cache.txt"
+        self.settings_path = self.asset_dir / ".cubepet_settings.json"
 
         self.root = tk.Tk()
         self.root.title("Ultra Nerviger Block")
@@ -61,9 +145,24 @@ class AnnoyingBlockPet:
         self.screen_h = self.root.winfo_screenheight()
 
         self._load_settings()
+        self.pet_profile: PetProfile = PET_PROFILES.get(self.pet_profile_id, PET_PROFILES["cube"])
+        self._apply_pet_profile(self.pet_profile_id, persist=False)
         self._discord_rpc = None
         self._discord_rpc_connected = False
         self._last_rpc_update_t = 0.0
+
+        # Feeding / "data" memory used for the prank editor typing.
+        self.food_tokens: list[str] = []
+
+        # Hunger state (only active when hunger_enabled is true).
+        self._hunger_last_t = time.monotonic()
+
+        # Options window state.
+        self.options_window: tk.Toplevel | None = None
+        self._opt_profile_var: tk.StringVar | None = None
+        self._opt_hunger_var: tk.BooleanVar | None = None
+        self._opt_mischief_var: tk.BooleanVar | None = None
+        self._opt_start_var: tk.BooleanVar | None = None
 
         self.block_size = 94
         self.root.geometry(f"{self.block_size}x{self.block_size}+140+120")
@@ -252,11 +351,12 @@ class AnnoyingBlockPet:
         self.root.after(650, self._annoy_loop)
         self.root.after(900, self._youtube_watch_loop)
         self.root.after(1100, self._discord_watch_loop)
+        self.root.after(1200, self._hunger_loop)
 
         if self.discord_rpc_enabled:
             self._init_discord_rpc()
         if self.notifications_enabled:
-            self._notify("CubePet", "CubePet ist gestartet.")
+            self._notify_pet(f"{self.pet_profile.name} ist gestartet.")
 
     def _log(self, msg: str) -> None:
         # Minimal file logger because this is a .pyw (no console).
@@ -339,7 +439,42 @@ class AnnoyingBlockPet:
         except Exception:
             return default
 
+    def _load_persistent_settings(self) -> dict[str, object]:
+        try:
+            if not self.settings_path.exists():
+                return {}
+            raw = self.settings_path.read_text(encoding="utf-8", errors="ignore")
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+        return {}
+
+    def _save_persistent_settings(self) -> None:
+        try:
+            data = {
+                "version": 1,
+                "profile_id": getattr(self, "pet_profile_id", "cube"),
+                "show_options_on_start": bool(getattr(self, "show_options_on_start", False)),
+                "hunger_enabled": bool(getattr(self, "hunger_enabled", False)),
+                "editor_mischief_enabled": bool(getattr(self, "editor_mischief_enabled", False)),
+                "hunger": float(getattr(self, "hunger", 1.0)),
+            }
+            txt = json.dumps(data, ensure_ascii=True, indent=2, sort_keys=True)
+            self.settings_path.write_text(txt, encoding="utf-8")
+        except Exception:
+            pass
+
+    def _normalize_profile_id(self, profile_id: str) -> str:
+        pid = (profile_id or "").strip().lower()
+        if pid in PET_PROFILES:
+            return pid
+        return "cube"
+
     def _load_settings(self) -> None:
+        persisted = self._load_persistent_settings()
+
         # Disable Windows "bell" sound spam by default. Set CUBEPET_SOUND=1 to enable.
         self.sounds_enabled = self._env_bool("CUBEPET_SOUND", default=False)
         self.debug_enabled = self._env_bool("CUBEPET_DEBUG", default=False)
@@ -378,6 +513,59 @@ class AnnoyingBlockPet:
         if self.image_max_s < self.image_min_s:
             self.image_max_s = self.image_min_s
 
+        # Pet profile / feature toggles (safe defaults, persisted values, env overrides).
+        self.pet_profile_id = self._normalize_profile_id(str(persisted.get("profile_id", "cube")))
+        self.show_options_on_start = bool(persisted.get("show_options_on_start", False))
+        self.hunger_enabled = bool(persisted.get("hunger_enabled", False))
+        self.editor_mischief_enabled = bool(persisted.get("editor_mischief_enabled", False))
+        try:
+            self.hunger = float(persisted.get("hunger", 1.0))
+        except Exception:
+            self.hunger = 1.0
+        self.hunger = max(0.0, min(1.0, self.hunger))
+
+        self.hunger_full_s = self._env_float("CUBEPET_HUNGER_FULL_S", default=900.0)
+        if self.hunger_full_s < 30.0:
+            self.hunger_full_s = 30.0
+
+        env_profile = os.environ.get("CUBEPET_PROFILE", "").strip()
+        if env_profile:
+            self.pet_profile_id = self._normalize_profile_id(env_profile)
+        if self._env_bool("CUBEPET_SELECT_PET", default=False):
+            self.show_options_on_start = True
+        if os.environ.get("CUBEPET_HUNGER", "").strip() != "":
+            self.hunger_enabled = self._env_bool("CUBEPET_HUNGER", default=self.hunger_enabled)
+        if os.environ.get("CUBEPET_EDITOR_MISCHIEF", "").strip() != "":
+            self.editor_mischief_enabled = self._env_bool(
+                "CUBEPET_EDITOR_MISCHIEF", default=self.editor_mischief_enabled
+            )
+
+    def _apply_pet_profile(self, profile_id: str, persist: bool = True) -> None:
+        pid = self._normalize_profile_id(profile_id)
+        self.pet_profile_id = pid
+        self.pet_profile = PET_PROFILES.get(pid, PET_PROFILES["cube"])
+        try:
+            self.root.title(f"{self.pet_profile.name} - Ultra Nerviger Block")
+        except Exception:
+            pass
+
+        # If the options window is open, keep the selection in sync.
+        try:
+            if self._opt_profile_var is not None:
+                self._opt_profile_var.set(self.pet_profile_id)
+        except Exception:
+            pass
+
+        if persist:
+            self._save_persistent_settings()
+
+        # Best-effort: refresh face/HUD when switching pets at runtime.
+        if getattr(self, "block", None) is not None:
+            try:
+                self._draw_face()
+            except Exception:
+                pass
+
     def _user_is_active(self) -> bool:
         if not self.respect_user_input:
             return False
@@ -392,7 +580,11 @@ class AnnoyingBlockPet:
             return False
         if self.scary_mode:
             return False
-        if self.close_prompt_window is not None or self.youtube_prompt_window is not None:
+        if (
+            self.close_prompt_window is not None
+            or self.youtube_prompt_window is not None
+            or getattr(self, "options_window", None) is not None
+        ):
             return False
         if self.discord_prompt_window is not None:
             return False
@@ -570,7 +762,7 @@ class AnnoyingBlockPet:
             return
         try:
             self._discord_rpc.update(
-                details="Spielt CubePet",
+                details=f"Spielt {getattr(self.pet_profile, 'name', 'CubePet')}",
                 state="Ultra Nerviger Block",
             )
             self._last_rpc_update_t = now
@@ -600,6 +792,14 @@ class AnnoyingBlockPet:
         except Exception:
             self._log("win10toast notification failed.")
             pass
+
+    def _notify_pet(self, message: str) -> None:
+        try:
+            title = getattr(self, "pet_profile", None)
+            name = title.name if title is not None else "CubePet"
+        except Exception:
+            name = "CubePet"
+        self._notify(name, message)
 
     def _ding(self) -> None:
         if self.sounds_enabled:
@@ -634,6 +834,7 @@ class AnnoyingBlockPet:
             self.intro_active
             or self.close_prompt_window is not None
             or self.youtube_prompt_window is not None
+            or self.options_window is not None
             or self.cursor_pingpong_active
         ):
             return
@@ -701,6 +902,7 @@ class AnnoyingBlockPet:
             or self.cursor_pingpong_active
             or self.close_attack_active
             or self.close_prompt_window is not None
+            or getattr(self, "options_window", None) is not None
         ):
             return
         if random.random() < 0.96:
@@ -756,7 +958,11 @@ class AnnoyingBlockPet:
                 self.clone_vx += random.uniform(-2.0, 2.0)
                 self.clone_vy += random.uniform(-2.0, 2.0)
 
-        if self.close_prompt_window is not None or self.youtube_prompt_window is not None:
+        if (
+            self.close_prompt_window is not None
+            or self.youtube_prompt_window is not None
+            or self.options_window is not None
+        ):
             self.vx = 0.0
             self.vy = 0.0
             self._update_emotion(now)
@@ -1156,6 +1362,7 @@ class AnnoyingBlockPet:
 
     def _show_close_prompt(self) -> None:
         self._hide_close_prompt()
+        self._hide_options_window()
 
         win = tk.Toplevel(self.root)
         win.overrideredirect(True)
@@ -1197,7 +1404,17 @@ class AnnoyingBlockPet:
             fg="#111111",
             relief="flat",
         )
-        no_btn.pack(side="left")
+        no_btn.pack(side="left", padx=(0, 6))
+        opt_btn = tk.Button(
+            buttons,
+            text="Optionen",
+            width=9,
+            command=self._close_prompt_options,
+            bg="#ffffff",
+            fg="#111111",
+            relief="flat",
+        )
+        opt_btn.pack(side="left")
 
         win.update_idletasks()
         px = int(self.x + self.block_size + 10)
@@ -1214,6 +1431,10 @@ class AnnoyingBlockPet:
     def _close_prompt_yes(self) -> None:
         self._hide_close_prompt()
         self._start_final_sequence()
+
+    def _close_prompt_options(self) -> None:
+        self._hide_close_prompt()
+        self._show_options_window()
 
     def _start_final_sequence(self) -> None:
         if self.dying:
@@ -1826,6 +2047,236 @@ class AnnoyingBlockPet:
             self.close_prompt_window.destroy()
         self.close_prompt_window = None
 
+    def _hide_options_window(self) -> None:
+        if self.options_window is not None and self.options_window.winfo_exists():
+            self.options_window.destroy()
+        self.options_window = None
+        self._opt_profile_var = None
+        self._opt_hunger_var = None
+        self._opt_mischief_var = None
+        self._opt_start_var = None
+
+    def _feed_from_file_dialog(self) -> None:
+        try:
+            chosen = filedialog.askopenfilename(
+                parent=self.root,
+                title="Fuettern mit Daten: Datei waehlen",
+            )
+        except Exception:
+            chosen = ""
+        if not chosen:
+            return
+        self._feed_from_path(Path(chosen))
+
+    def _tokens_from_data(self, data: bytes) -> list[str]:
+        # Keep tokens short and printable; they will be inserted into the prank editor window.
+        try:
+            s = data.decode("utf-8", errors="ignore")
+        except Exception:
+            s = ""
+        toks = re.findall(r"[A-Za-z0-9_]{2,}", s)
+        out: list[str] = []
+        for t in toks:
+            t = t.strip()
+            if not t:
+                continue
+            if len(t) > 24:
+                t = t[:24]
+            out.append(t)
+            if len(out) >= 160:
+                break
+        if out:
+            random.shuffle(out)
+            return out
+
+        # Binary / no words: fall back to base64 chunks.
+        b64 = base64.b64encode(data[:2048]).decode("ascii", errors="ignore")
+        out = [b64[i : i + 10] for i in range(0, min(len(b64), 600), 10) if b64[i : i + 10]]
+        if out:
+            random.shuffle(out)
+        return out
+
+    def _feed_from_path(self, path: Path) -> None:
+        try:
+            with path.open("rb") as f:
+                sample = f.read(8192)
+        except Exception:
+            self._notify_pet("Konnte Datei nicht lesen.")
+            return
+
+        new_tokens = self._tokens_from_data(sample)
+        if new_tokens:
+            self.food_tokens.extend(new_tokens)
+            # Keep memory bounded.
+            if len(self.food_tokens) > 900:
+                self.food_tokens = self.food_tokens[-700:]
+
+        # Feeding refills hunger (if enabled) and updates the HUD.
+        try:
+            self.hunger = max(0.0, min(1.0, float(getattr(self, "hunger", 1.0)) + 0.55))
+        except Exception:
+            self.hunger = 1.0
+        self._save_persistent_settings()
+        try:
+            self._draw_hud()
+        except Exception:
+            pass
+
+        self._notify_pet(f"Nom nom: {path.name}")
+
+    def _show_options_window(self) -> None:
+        if self.intro_active:
+            return
+        self._hide_options_window()
+
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.configure(bg="#dbeafe")
+
+        frame = tk.Frame(win, bg="#dbeafe", bd=2, relief="solid")
+        frame.pack(fill="both", expand=True)
+
+        title = tk.Label(
+            frame,
+            text=f"Optionen ({self.pet_profile.name})",
+            bg="#dbeafe",
+            fg="#0f172a",
+            font=("Segoe UI", 9, "bold"),
+            padx=10,
+            pady=6,
+        )
+        title.pack(anchor="w")
+
+        # Pet selection
+        self._opt_profile_var = tk.StringVar(value=self.pet_profile_id)
+
+        def _on_profile_change() -> None:
+            if self._opt_profile_var is None:
+                return
+            self._apply_pet_profile(self._opt_profile_var.get(), persist=True)
+            try:
+                title.configure(text=f"Optionen ({self.pet_profile.name})")
+            except Exception:
+                pass
+
+        pets = tk.Frame(frame, bg="#dbeafe")
+        pets.pack(fill="x", padx=10, pady=(0, 6))
+        tk.Label(
+            pets,
+            text="Pet:",
+            bg="#dbeafe",
+            fg="#0f172a",
+            font=("Segoe UI", 9, "bold"),
+        ).pack(side="left")
+        for pid in ["cube", "aki", "pamuk"]:
+            prof = PET_PROFILES.get(pid)
+            if prof is None:
+                continue
+            tk.Radiobutton(
+                pets,
+                text=prof.name,
+                bg="#dbeafe",
+                fg="#0f172a",
+                selectcolor="#bfdbfe",
+                activebackground="#dbeafe",
+                activeforeground="#0f172a",
+                variable=self._opt_profile_var,
+                value=pid,
+                command=_on_profile_change,
+            ).pack(side="left", padx=(8, 0))
+
+        # Toggles
+        toggles = tk.Frame(frame, bg="#dbeafe")
+        toggles.pack(fill="x", padx=10, pady=(0, 6))
+        self._opt_hunger_var = tk.BooleanVar(value=bool(getattr(self, "hunger_enabled", False)))
+        self._opt_mischief_var = tk.BooleanVar(
+            value=bool(getattr(self, "editor_mischief_enabled", False))
+        )
+        self._opt_start_var = tk.BooleanVar(value=bool(getattr(self, "show_options_on_start", False)))
+
+        def _on_toggle() -> None:
+            try:
+                if self._opt_hunger_var is not None:
+                    self.hunger_enabled = bool(self._opt_hunger_var.get())
+                if self._opt_mischief_var is not None:
+                    self.editor_mischief_enabled = bool(self._opt_mischief_var.get())
+                if self._opt_start_var is not None:
+                    self.show_options_on_start = bool(self._opt_start_var.get())
+                self._save_persistent_settings()
+                self._draw_hud()
+            except Exception:
+                pass
+
+        tk.Checkbutton(
+            toggles,
+            text="Hunger-Bar",
+            bg="#dbeafe",
+            fg="#0f172a",
+            selectcolor="#bfdbfe",
+            activebackground="#dbeafe",
+            activeforeground="#0f172a",
+            variable=self._opt_hunger_var,
+            command=_on_toggle,
+        ).pack(side="left")
+        tk.Checkbutton(
+            toggles,
+            text="Editor-Mischief",
+            bg="#dbeafe",
+            fg="#0f172a",
+            selectcolor="#bfdbfe",
+            activebackground="#dbeafe",
+            activeforeground="#0f172a",
+            variable=self._opt_mischief_var,
+            command=_on_toggle,
+        ).pack(side="left", padx=(10, 0))
+        tk.Checkbutton(
+            toggles,
+            text="Beim Start",
+            bg="#dbeafe",
+            fg="#0f172a",
+            selectcolor="#bfdbfe",
+            activebackground="#dbeafe",
+            activeforeground="#0f172a",
+            variable=self._opt_start_var,
+            command=_on_toggle,
+        ).pack(side="left", padx=(10, 0))
+
+        # Actions
+        actions = tk.Frame(frame, bg="#dbeafe")
+        actions.pack(fill="x", padx=10, pady=(0, 10))
+        tk.Button(
+            actions,
+            text="Fuettern (Datei...)",
+            command=self._feed_from_file_dialog,
+            bg="#ffffff",
+            fg="#0f172a",
+            relief="flat",
+            padx=8,
+            pady=3,
+        ).pack(side="left")
+        tk.Button(
+            actions,
+            text="Schliessen",
+            command=self._hide_options_window,
+            bg="#ffffff",
+            fg="#0f172a",
+            relief="flat",
+            padx=8,
+            pady=3,
+        ).pack(side="right")
+
+        win.update_idletasks()
+        px = int(self.x + self.block_size + 10)
+        py = int(self.y - 10)
+        max_x = max(0, self.screen_w - win.winfo_width())
+        max_y = max(0, self.screen_h - win.winfo_height())
+        px = max(0, min(px, max_x))
+        py = max(0, min(py, max_y))
+        win.geometry(f"+{px}+{py}")
+
+        self.options_window = win
+
     def _start_close_attack(self) -> None:
         if USER32 is None:
             return
@@ -2098,7 +2549,7 @@ class AnnoyingBlockPet:
                 if now >= self.next_editor_heist_at:
                     if editor_idle_ok and self._start_editor_heist():
                         if self.notifications_enabled:
-                            self._notify("CubePet", "CubePet macht jetzt Editor-Heist.")
+                            self._notify_pet(f"{self.pet_profile.name} macht jetzt Editor-Heist.")
                         self.next_editor_heist_at = now + random.uniform(22.0, 54.0)
                         self.next_image_heist_at = max(
                             self.next_image_heist_at, now + random.uniform(7.0, 16.0)
@@ -2108,7 +2559,7 @@ class AnnoyingBlockPet:
                 elif now >= self.next_image_heist_at:
                     if image_idle_ok and self._start_image_heist():
                         if self.notifications_enabled:
-                            self._notify("CubePet", "CubePet klaut ein Bild.")
+                            self._notify_pet(f"{self.pet_profile.name} klaut ein Bild.")
                         self.next_image_heist_at = now + random.uniform(self.image_min_s, self.image_max_s)
                     else:
                         # If it couldn't start (user too active / no images yet), retry soon.
@@ -2175,6 +2626,46 @@ class AnnoyingBlockPet:
             self._update_discord_rpc(force=False)
         self.root.after(delay, self._annoy_loop)
 
+    def _hunger_loop(self) -> None:
+        if self.dying:
+            return
+        now = time.monotonic()
+        try:
+            last = float(getattr(self, "_hunger_last_t", now))
+        except Exception:
+            last = now
+        dt = max(0.0, min(now - last, 4.0))
+        self._hunger_last_t = now
+
+        if bool(getattr(self, "hunger_enabled", False)):
+            try:
+                full_s = float(getattr(self, "hunger_full_s", 900.0))
+            except Exception:
+                full_s = 900.0
+            if full_s < 30.0:
+                full_s = 30.0
+            try:
+                h = float(getattr(self, "hunger", 1.0))
+            except Exception:
+                h = 1.0
+            h = max(0.0, min(1.0, h - (dt / full_s)))
+            self.hunger = h
+            try:
+                self._draw_hud()
+            except Exception:
+                pass
+
+            # Persist hunger occasionally without spamming disk writes.
+            try:
+                last_save = float(getattr(self, "_hunger_last_save_t", 0.0))
+            except Exception:
+                last_save = 0.0
+            if now - last_save >= 45.0:
+                self._hunger_last_save_t = now
+                self._save_persistent_settings()
+
+        self.root.after(1200, self._hunger_loop)
+
     def _youtube_watch_loop(self) -> None:
         # Checks if the user is currently in a browser on youtube.com and prompts once per "session".
         # A "session" is continuous time while a YouTube tab/window is foreground.
@@ -2196,10 +2687,11 @@ class AnnoyingBlockPet:
                 not self._youtube_prompted_session
                 and self.youtube_prompt_window is None
                 and not self.intro_active
+                and self.options_window is None
             ):
                 self._youtube_prompted_session = True
                 if self.notifications_enabled:
-                    self._notify("CubePet", "YouTube erkannt: CubePet nervt jetzt.")
+                    self._notify_pet(f"YouTube erkannt: {self.pet_profile.name} nervt jetzt.")
                 self._show_youtube_prompt()
 
         self.root.after(700, self._youtube_watch_loop)
@@ -2225,11 +2717,12 @@ class AnnoyingBlockPet:
                 and not self.cursor_pingpong_active
                 and self.close_prompt_window is None
                 and self.youtube_prompt_window is None
+                and self.options_window is None
                 and self.discord_prompt_window is None
             ):
                 self._discord_prompted_session = True
                 if self.notifications_enabled:
-                    self._notify("CubePet", "Discord erkannt: CubePet schaut zu.")
+                    self._notify_pet(f"Discord erkannt: {self.pet_profile.name} schaut zu.")
                 self._on_discord_foreground()
 
         self.root.after(800, self._discord_watch_loop)
@@ -2796,9 +3289,17 @@ class AnnoyingBlockPet:
                     now = time.monotonic()
                     self.heist_stage = "linger"
                     self.heist_linger_until = now + random.uniform(2.2, 4.0)
-                    if random.random() < 0.12:
+                    chance = 0.12
+                    dur = 2.0
+                    if getattr(self, "editor_mischief_enabled", False):
+                        try:
+                            chance = float(getattr(self.pet_profile, "editor_typing_chance", 0.22))
+                        except Exception:
+                            chance = 0.22
+                        dur = random.uniform(1.6, 3.1)
+                    if random.random() < chance:
                         self.heist_editor_typing_until = min(
-                            self.heist_linger_until, now + 2.0
+                            self.heist_linger_until, now + dur
                         )
                         self.heist_editor_next_type = 0.0
                     else:
@@ -2899,7 +3400,7 @@ class AnnoyingBlockPet:
             titlebar.pack(fill="x")
             title = tk.Label(
                 titlebar,
-                text="annoying_editor.txt - Notepad",
+                text=self.pet_profile.editor_title,
                 bg="#e5e7eb",
                 fg="#111827",
                 font=("Segoe UI", 9, "bold"),
@@ -2953,9 +3454,7 @@ class AnnoyingBlockPet:
             text.pack(fill="both", expand=True, padx=6, pady=6)
             text.insert(
                 "end",
-                "HEHEHEHA\n\n"
-                "ich zieh den editor einfach von der seite rein.\n"
-                "du tippst? nein, ich tippe.\n",
+                self.pet_profile.editor_intro_text,
             )
             text.see("end")
             self.heist_editor_text = text
@@ -3162,23 +3661,55 @@ class AnnoyingBlockPet:
         except Exception:
             pass
 
+    def _editor_random_chunk(self) -> str:
+        # Only types into the prank Notepad-style window (never edits real files).
+        prof = getattr(self, "pet_profile", PET_PROFILES["cube"])
+        base_chunks = list(getattr(prof, "editor_chunks", ())) or ["lol "]
+
+        mischief = bool(getattr(self, "editor_mischief_enabled", False))
+        hunger_enabled = bool(getattr(self, "hunger_enabled", False))
+        try:
+            hunger = float(getattr(self, "hunger", 1.0))
+        except Exception:
+            hunger = 1.0
+
+        # If hungry, beg for data.
+        if hunger_enabled and hunger <= 0.22 and random.random() < 0.55:
+            chunk = random.choice(
+                [
+                    "fuetter mich ",
+                    "daten pls ",
+                    "ich hab hunger ",
+                    "gib daten ",
+                    "DATA! ",
+                ]
+            )
+        # If we got fed with data, occasionally spit it back out into the editor.
+        elif mischief and self.food_tokens and random.random() < 0.55:
+            k = min(len(self.food_tokens), random.randint(1, 3))
+            toks = random.sample(self.food_tokens, k=k)
+            chunk = " ".join(toks) + " "
+        else:
+            chunk = random.choice(base_chunks)
+
+        # Extra "random kacke" in mischief mode.
+        if mischief and random.random() < 0.14:
+            alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
+            n = random.randint(4, 11)
+            chunk += "".join(random.choice(alphabet) for _ in range(n)) + " "
+
+        if len(chunk) > 140:
+            chunk = chunk[:140] + " "
+        return chunk
+
     def _tick_editor_typing(self, now: float) -> None:
         if self.heist_editor_text is None:
             return
         if now < self.heist_editor_next_type:
             return
 
-        chunk = random.choice(
-            [
-                "Halllllo ",
-                "HEHEHEHA ",
-                "lol ",
-                "du kannst nix machen ",
-                "hehe ",
-                "hmmmm ",
-            ]
-        )
-        if random.random() < 0.35:
+        chunk = self._editor_random_chunk()
+        if random.random() < (0.40 if getattr(self, "editor_mischief_enabled", False) else 0.35):
             chunk += "\n"
         self.heist_editor_text.insert("end", chunk)
         self.heist_editor_text.see("end")
@@ -3254,6 +3785,8 @@ class AnnoyingBlockPet:
         if self.intro_window is not None and self.intro_window.winfo_exists():
             self.intro_window.destroy()
         self.intro_window = None
+        if bool(getattr(self, "show_options_on_start", False)):
+            self._show_options_window()
 
     def _spawn_clone(self, now: float) -> None:
         # Clone is a separate window that runs around for a while, then disappears.
@@ -3380,6 +3913,7 @@ class AnnoyingBlockPet:
                     image=self._final_bloody_img,
                     tags="face",
                 )
+                self._draw_hud()
                 return
             key = "mad"
 
@@ -3400,6 +3934,7 @@ class AnnoyingBlockPet:
                 font=("Segoe UI", 10, "bold"),
                 tags="face",
             )
+            self._draw_hud()
             return
 
         self.block.create_image(
@@ -3408,6 +3943,98 @@ class AnnoyingBlockPet:
             image=image,
             tags="face",
         )
+        self._draw_hud()
+
+    def _draw_hud(self) -> None:
+        # Lightweight overlay; used for optional hunger bar and per-pet name tag.
+        try:
+            self.block.delete("hud")
+        except Exception:
+            return
+
+        hunger_on = bool(getattr(self, "hunger_enabled", False))
+        show_name = bool(getattr(self, "pet_profile_id", "cube") != "cube")
+        if (not hunger_on) and (not show_name):
+            return
+
+        if show_name:
+            try:
+                name = str(getattr(self.pet_profile, "name", "")).strip() or "Pet"
+            except Exception:
+                name = "Pet"
+            pid = str(getattr(self, "pet_profile_id", "cube"))
+            if pid == "aki":
+                tag_bg = "#fecaca"
+                tag_fg = "#7f1d1d"
+            elif pid == "pamuk":
+                tag_bg = "#bbf7d0"
+                tag_fg = "#14532d"
+            else:
+                tag_bg = "#e5e7eb"
+                tag_fg = "#111827"
+            self.block.create_rectangle(
+                4,
+                4,
+                4 + min(64, 8 + len(name) * 6),
+                18,
+                fill=tag_bg,
+                outline="",
+                tags="hud",
+            )
+            self.block.create_text(
+                8,
+                11,
+                text=name[:10],
+                fill=tag_fg,
+                font=("Segoe UI", 8, "bold"),
+                anchor="w",
+                tags="hud",
+            )
+
+        if not hunger_on:
+            return
+
+        try:
+            h = float(getattr(self, "hunger", 1.0))
+        except Exception:
+            h = 1.0
+        h = max(0.0, min(1.0, h))
+
+        pad = 5
+        bar_h = 6
+        x0 = pad
+        x1 = max(pad + 1, self.block_size - pad)
+        y1 = max(pad + 1, self.block_size - pad)
+        y0 = max(pad, y1 - bar_h)
+
+        if h >= 0.50:
+            color = "#22c55e"
+        elif h >= 0.20:
+            color = "#f59e0b"
+        else:
+            color = "#ef4444"
+
+        self.block.create_rectangle(
+            x0,
+            y0,
+            x1,
+            y1,
+            fill="#0b0b0b",
+            outline="#111111",
+            width=1,
+            tags="hud",
+        )
+        fill_w = int((x1 - x0) * h)
+        if fill_w > 0:
+            self.block.create_rectangle(
+                x0,
+                y0,
+                x0 + fill_w,
+                y1,
+                fill=color,
+                outline="",
+                tags="hud",
+            )
 
     def _load_face_assets(self) -> dict[str, object]:
         files = {
