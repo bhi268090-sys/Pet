@@ -8,7 +8,7 @@ import tkinter as tk
 from pathlib import Path
 
 try:
-    from PIL import Image, ImageTk  # type: ignore
+    from PIL import Image, ImageTk, ImageOps  # type: ignore
 
     PIL_AVAILABLE = True
 except Exception:
@@ -42,6 +42,8 @@ class AnnoyingBlockPet:
         # - CUBEPET_IMAGE_MIN_S=10 / CUBEPET_IMAGE_MAX_S=22 image-heist window (seconds)
         # - CUBEPET_DISCORD_RPC=1 enables Discord Rich Presence (default off)
         # - CUBEPET_DISCORD_RPC_CLIENT_ID=... required for Discord RPC
+        # - CUBEPET_DEBUG=1 enables extra logging to cubepet.log (default off)
+        # - CUBEPET_HORROR_GAME=0 disables the hidden horror mini-game (default on)
         self.asset_dir = Path(__file__).resolve().parent
         self.log_path = self.asset_dir / "cubepet.log"
         self.image_cache_path = self.asset_dir / ".image_cache.txt"
@@ -51,6 +53,8 @@ class AnnoyingBlockPet:
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
         self.root.configure(bg="black")
+        # .pyw: make sure callback exceptions don't disappear silently.
+        self.root.report_callback_exception = self._report_callback_exception  # type: ignore[assignment]
 
         # Optimization: Cache screen dimensions to avoid Tcl calls in loops
         self.screen_w = self.root.winfo_screenwidth()
@@ -120,6 +124,12 @@ class AnnoyingBlockPet:
         self.heist_editor_typing_until = 0.0
         self.heist_editor_next_type = 0.0
         self.heist_linger_until = 0.0
+        # Visual rope overlay used during image-heist pull.
+        self.rope_window: tk.Toplevel | None = None
+        self.rope_canvas: tk.Canvas | None = None
+        self.rope_line_shadow = None
+        self.rope_line = None
+        self.rope_phase = random.uniform(0.0, math.pi * 2.0)
         self.angry_until = 0.0
         self.angry_catch_cooldown_until = 0.0
 
@@ -174,6 +184,38 @@ class AnnoyingBlockPet:
         self._final_bloody_img = None
         self.scary_editor_count = 0
         self._static_noise_wav: bytes | None = None
+        self._log_once_keys: set[str] = set()
+
+        # Final/Horror screen state (used for the Easter egg mini-game).
+        self.final_window: tk.Toplevel | None = None
+        self.final_canvas: tk.Canvas | None = None
+        self.final_text_idx = 0
+        self.final_message = ""
+        self._final_stage = "idle"  # idle | dots | ending | game
+        self._final_after_show_bloody: str | None = None
+        self._final_after_type_msg: str | None = None
+        self._final_after_resurrect: str | None = None
+        self._final_after_fx: str | None = None
+        self._final_dot_centers: list[tuple[int, int]] = []
+        self._final_dot_item_ids: list[int] = []
+        self._final_click_seq: list[int] = []
+        self._final_click_started_at = 0.0
+
+        self._hg_active = False
+        self._hg_after_tick: str | None = None
+        self._hg_after_fx: str | None = None
+        self._hg_started_at = 0.0
+        self._hg_score = 0
+        self._hg_target_score = 3
+        self._hg_time_limit_s = 22.0
+        self._hg_enemy_x = 0.0
+        self._hg_enemy_y = 0.0
+        self._hg_enemy_v = 4.2
+        self._hg_collect_x = 0.0
+        self._hg_collect_y = 0.0
+        self._hg_noise_items: list[int] = []
+        self._hg_ids: dict[str, int] = {}
+        self._hg_last_mouse = (self.screen_w // 2, self.screen_h // 2)
 
         self.intro_active = True
         self.intro_until = time.monotonic() + 2.9
@@ -202,8 +244,9 @@ class AnnoyingBlockPet:
         # Right click: normal close prompt (no trolling).
         self.block.bind("<ButtonPress-3>", self._on_right_click)
 
-        self.root.bind("<Escape>", lambda _event: self.root.destroy())
-        self.root.bind("<Control-Shift-Q>", lambda _event: self.root.destroy())
+        # Emergency exit (works even when a Toplevel has focus).
+        self.root.bind_all("<Escape>", self._on_escape)
+        self.root.bind_all("<Control-Shift-Q>", self._on_ctrl_shift_q)
 
         self.root.after(16, self._motion_loop)
         self.root.after(650, self._annoy_loop)
@@ -222,6 +265,58 @@ class AnnoyingBlockPet:
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
             with self.log_path.open("a", encoding="utf-8") as f:
                 f.write(f"[{ts}] {msg}\n")
+        except Exception:
+            pass
+    
+    def _log_once(self, key: str, msg: str) -> None:
+        try:
+            keys = getattr(self, "_log_once_keys", None)
+            if keys is None:
+                self._log_once_keys = set()
+                keys = self._log_once_keys
+            if key in keys:
+                return
+            keys.add(key)
+            self._log(msg)
+        except Exception:
+            pass
+
+    def _log_exc(self, where: str) -> None:
+        # Best-effort exception logger (useful for .pyw where stderr is hidden).
+        try:
+            import traceback
+
+            tb = traceback.format_exc().rstrip()
+            if not tb:
+                return
+            if bool(getattr(self, "debug_enabled", False)):
+                self._log(f"EXC {where}:\n{tb}")
+            else:
+                # Keep logs small unless debug is enabled.
+                last = tb.splitlines()[-1] if tb else "unknown"
+                self._log(f"EXC {where}: {last}")
+        except Exception:
+            pass
+
+    def _report_callback_exception(self, exc, val, tb) -> None:
+        try:
+            import traceback
+
+            msg = "".join(traceback.format_exception(exc, val, tb)).rstrip()
+            debug = bool(getattr(self, "debug_enabled", False))
+            if debug:
+                self._log(f"TK EXC:\n{msg}")
+            else:
+                last = msg.splitlines()[-1] if msg else "unknown"
+                self._log(f"TK EXC: {last}")
+        except Exception:
+            pass
+
+    def _after_cancel(self, after_id: str | None) -> None:
+        if not after_id:
+            return
+        try:
+            self.root.after_cancel(after_id)
         except Exception:
             pass
 
@@ -247,6 +342,8 @@ class AnnoyingBlockPet:
     def _load_settings(self) -> None:
         # Disable Windows "bell" sound spam by default. Set CUBEPET_SOUND=1 to enable.
         self.sounds_enabled = self._env_bool("CUBEPET_SOUND", default=False)
+        self.debug_enabled = self._env_bool("CUBEPET_DEBUG", default=False)
+        self.horror_game_enabled = self._env_bool("CUBEPET_HORROR_GAME", default=True)
 
         # Fix for "typing gets blocked": don't steal focus by default.
         # Old behavior can be re-enabled with CUBEPET_STEAL_FOCUS=1.
@@ -286,10 +383,14 @@ class AnnoyingBlockPet:
             return False
         return self._user_idle_seconds() < self.active_grace_s
 
-    def _can_start_major_prank(self, now: float) -> bool:
+    def _can_start_major_prank(self, now: float, user_active: bool | None = None) -> bool:
+        if user_active is None:
+            user_active = self._user_is_active()
         if self.intro_active:
             return False
         if self._dragging or self.ignore_drag_until_release:
+            return False
+        if self.scary_mode:
             return False
         if self.close_prompt_window is not None or self.youtube_prompt_window is not None:
             return False
@@ -297,11 +398,15 @@ class AnnoyingBlockPet:
             return False
         if self.heist_active or self.cursor_heist_active or self.cursor_pingpong_active:
             return False
+        if self.heist_payload_window is not None:
+            return False
         if self.mouse_lock_active or self.close_attack_active:
+            return False
+        if self.window_kill_active:
             return False
         if now < self.stunned_until:
             return False
-        if self._user_is_active():
+        if user_active:
             return False
         return True
 
@@ -360,6 +465,8 @@ class AnnoyingBlockPet:
                 self.root.after(0, apply)
             except Exception:
                 self._image_scan_in_progress = False
+                if self.debug_enabled:
+                    self._log_exc("_start_image_scan_background.worker")
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -375,7 +482,31 @@ class AnnoyingBlockPet:
             style = USER32.GetWindowLongW(hwnd, GWL_EXSTYLE)
             USER32.SetWindowLongW(hwnd, GWL_EXSTYLE, style | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW)
         except Exception:
-            pass
+            self._log_once("noactivate_failed", "Failed to mark prank window as NOACTIVATE.")
+            if self.debug_enabled:
+                self._log_exc("_make_noactivate")
+    
+    def _make_clickthrough(self, win: tk.Toplevel) -> None:
+        # Used for fullscreen overlay visuals (rope). Best-effort.
+        if USER32 is None:
+            return
+        try:
+            hwnd = int(win.winfo_id())
+            GWL_EXSTYLE = -20
+            WS_EX_LAYERED = 0x00080000
+            WS_EX_TRANSPARENT = 0x00000020
+            WS_EX_NOACTIVATE = 0x08000000
+            WS_EX_TOOLWINDOW = 0x00000080
+            style = USER32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            USER32.SetWindowLongW(
+                hwnd,
+                GWL_EXSTYLE,
+                style | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+            )
+        except Exception:
+            self._log_once("clickthrough_failed", "Failed to mark overlay window as click-through.")
+            if self.debug_enabled:
+                self._log_exc("_make_clickthrough")
 
     # (removed: pause/status UI)
 
@@ -476,6 +607,27 @@ class AnnoyingBlockPet:
                 self.root.bell()
             except tk.TclError:
                 pass
+    
+    def _on_escape(self, _event=None):
+        # Prefer "escape hatch" behavior inside the horror flow instead of killing the whole app.
+        try:
+            if getattr(self, "_hg_active", False):
+                self._horror_game_end(win=False, aborted=True)
+                return "break"
+            if getattr(self, "dying", False) and getattr(self, "final_window", None) is not None:
+                self._resurrect_pet()
+                return "break"
+            self.root.destroy()
+        except Exception:
+            pass
+        return "break"
+
+    def _on_ctrl_shift_q(self, _event=None):
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+        return "break"
 
     def _start_drag(self, event) -> None:
         if (
@@ -1064,31 +1216,503 @@ class AnnoyingBlockPet:
         self._start_final_sequence()
 
     def _start_final_sequence(self) -> None:
+        if self.dying:
+            return
+
         self.dying = True
+        self.scary_mode = False
+        self._hg_active = False
+        self._final_stage = "dots"
+        self._final_click_seq = []
+        self._final_click_started_at = 0.0
+        self._after_cancel(self._final_after_show_bloody)
+        self._after_cancel(self._final_after_type_msg)
+        self._after_cancel(self._final_after_resurrect)
+        self._after_cancel(self._final_after_fx)
+        self._final_after_show_bloody = None
+        self._final_after_type_msg = None
+        self._final_after_resurrect = None
+        self._final_after_fx = None
+
         self.root.withdraw()
+
+        if self.final_window is not None and self.final_window.winfo_exists():
+            try:
+                self.final_window.destroy()
+            except Exception:
+                pass
+        self.final_window = None
+        self.final_canvas = None
         
         self.final_window = tk.Toplevel(self.root)
-        self.final_window.configure(bg="black", cursor="none")
+        # Keep cursor visible for the (hidden) click-sequence Easter egg.
+        self.final_window.configure(bg="black", cursor="arrow")
         self.final_window.geometry(f"{self.screen_w}x{self.screen_h}+0+0")
         self.final_window.overrideredirect(True)
         self.final_window.attributes("-topmost", True)
         
         self.final_canvas = tk.Canvas(self.final_window, bg="black", highlightthickness=0)
         self.final_canvas.pack(fill="both", expand=True)
+        self.final_canvas.bind("<Motion>", self._hg_on_motion)
+        if self.horror_game_enabled:
+            self.final_canvas.bind("<Button-1>", self._on_final_canvas_click)
         
         cx = self.screen_w // 2
         cy = self.screen_h // 2
         r = 25
         gap = 90
+        self._final_dot_centers = []
+        self._final_dot_item_ids = []
         for i in range(-1, 2):
             x = cx + i * gap
-            self.final_canvas.create_oval(x - r, cy - r, x + r, cy + r, fill="#ff0000", outline="#ff0000", tags="dots")
+            self._final_dot_centers.append((x, cy))
+            item = self.final_canvas.create_oval(
+                x - r,
+                cy - r,
+                x + r,
+                cy + r,
+                fill="#ff0000",
+                outline="#ff0000",
+                tags=("dots", f"dot{len(self._final_dot_centers)-1}"),
+            )
+            self._final_dot_item_ids.append(item)
             
-        self.root.after(10000, self._show_bloody_ending)
+        self._final_dots_fx()
+        self._final_after_show_bloody = self.root.after(10000, self._show_bloody_ending)
+
+    def _hg_on_motion(self, event) -> None:
+        # Motion fallback (when USER32 cursor APIs are unavailable).
+        try:
+            self._hg_last_mouse = (int(event.x), int(event.y))
+        except Exception:
+            pass
+
+    def _final_dots_fx(self) -> None:
+        # Subtle pulse/flicker so the dots feel like "eyes".
+        if self._final_stage != "dots":
+            return
+        if self.final_canvas is None:
+            return
+        try:
+            if not self.final_canvas.winfo_exists():
+                return
+        except Exception:
+            return
+
+        base_r = 25
+        pulse = random.randint(-3, 3)
+        r = max(16, base_r + pulse)
+        for idx, (cx, cy) in enumerate(self._final_dot_centers):
+            if idx >= len(self._final_dot_item_ids):
+                continue
+            item = self._final_dot_item_ids[idx]
+            try:
+                self.final_canvas.coords(item, cx - r, cy - r, cx + r, cy + r)
+                # Random tiny brightness changes look like a CRT glitch.
+                c = "#ff0000" if random.random() < 0.75 else "#b30000"
+                self.final_canvas.itemconfig(item, fill=c, outline=c)
+            except Exception:
+                continue
+
+        # Very slight background flicker.
+        try:
+            bg = "#000000" if random.random() < 0.86 else "#050000"
+            self.final_canvas.configure(bg=bg)
+        except Exception:
+            pass
+
+        self._after_cancel(self._final_after_fx)
+        self._final_after_fx = self.root.after(random.randint(70, 140), self._final_dots_fx)
+
+    def _on_final_canvas_click(self, event) -> None:
+        if not self.horror_game_enabled:
+            return
+        if self._final_stage != "dots":
+            return
+        if self.final_canvas is None:
+            return
+
+        # Identify which dot was clicked (if any).
+        try:
+            ex = int(getattr(event, "x", -9999))
+            ey = int(getattr(event, "y", -9999))
+        except Exception:
+            return
+        hit = None
+        for idx, (cx, cy) in enumerate(self._final_dot_centers):
+            dx = ex - cx
+            dy = ey - cy
+            if (dx * dx + dy * dy) ** 0.5 <= 32.0:
+                hit = idx
+                break
+        if hit is None:
+            return
+
+        # Hidden sequence: click the three dots left -> middle -> right quickly.
+        secret = [0, 1, 2]
+        now = time.monotonic()
+        if self._final_click_started_at <= 0.0 or (now - self._final_click_started_at) > 1.6:
+            self._final_click_started_at = now
+            self._final_click_seq = []
+        self._final_click_seq.append(hit)
+
+        # If the sequence diverges, reset but allow restarting immediately.
+        prefix_ok = self._final_click_seq == secret[: len(self._final_click_seq)]
+        if not prefix_ok:
+            self._final_click_started_at = now
+            self._final_click_seq = [hit] if hit == secret[0] else []
+            return
+
+        if len(self._final_click_seq) >= len(secret):
+            self._final_click_seq = []
+            self._final_click_started_at = 0.0
+            self._start_horror_game()
+
+    def _start_horror_game(self) -> None:
+        # Convert the final screen into a hidden horror mini-game (Easter egg).
+        if self.final_canvas is None or self.final_window is None:
+            return
+        try:
+            if not self.final_canvas.winfo_exists():
+                return
+        except Exception:
+            return
+
+        self._final_stage = "game"
+        self._hg_active = True
+        self._hg_started_at = time.monotonic()
+        self._hg_score = 0
+        self._hg_enemy_v = random.uniform(3.8, 4.9)
+        self._hg_noise_items = []
+        self._hg_ids = {}
+
+        # Cancel the normal ending flow.
+        self._after_cancel(self._final_after_show_bloody)
+        self._after_cancel(self._final_after_fx)
+        self._final_after_show_bloody = None
+        self._final_after_fx = None
+
+        # Make it harder to "read" the screen: hide cursor once the game starts.
+        try:
+            self.final_window.configure(cursor="none")
+        except Exception:
+            pass
+
+        # Setup scene.
+        self.final_canvas.delete("all")
+        self.final_canvas.configure(bg="black")
+
+        w = max(1, int(self.screen_w))
+        h = max(1, int(self.screen_h))
+
+        # Player is the cursor (tracked globally on Windows, otherwise via <Motion> events).
+        px, py = self._get_cursor_pos() or self._hg_last_mouse
+        px = max(0, min(int(px), w - 1))
+        py = max(0, min(int(py), h - 1))
+        self._hg_ids["player"] = self.final_canvas.create_oval(
+            px - 6, py - 6, px + 6, py + 6, fill="#c7d2fe", outline="#111827", width=2, tags="hg"
+        )
+
+        # Enemy: a big "eye" that hunts you.
+        edge = random.choice(["l", "r", "t", "b"])
+        if edge == "l":
+            self._hg_enemy_x, self._hg_enemy_y = (-40.0, float(random.randint(0, h)))
+        elif edge == "r":
+            self._hg_enemy_x, self._hg_enemy_y = (float(w + 40), float(random.randint(0, h)))
+        elif edge == "t":
+            self._hg_enemy_x, self._hg_enemy_y = (float(random.randint(0, w)), -40.0)
+        else:
+            self._hg_enemy_x, self._hg_enemy_y = (float(random.randint(0, w)), float(h + 40))
+
+        ex, ey = int(self._hg_enemy_x), int(self._hg_enemy_y)
+        self._hg_ids["enemy_outer"] = self.final_canvas.create_oval(
+            ex - 26, ey - 18, ex + 26, ey + 18, fill="#2a0000", outline="#7f0000", width=3, tags="hg"
+        )
+        self._hg_ids["enemy_iris"] = self.final_canvas.create_oval(
+            ex - 10, ey - 10, ex + 10, ey + 10, fill="#ff0000", outline="#b30000", width=2, tags="hg"
+        )
+        self._hg_ids["enemy_pupil"] = self.final_canvas.create_oval(
+            ex - 4, ey - 4, ex + 4, ey + 4, fill="#000000", outline="#000000", width=1, tags="hg"
+        )
+
+        # Collectible "sigil".
+        self._hg_spawn_collectible()
+
+        # Noise overlay (re-used items, updated in the FX tick).
+        for _ in range(90):
+            x = random.randint(0, w)
+            y = random.randint(0, h)
+            item = self.final_canvas.create_line(
+                x, y, x + random.randint(1, 120), y, fill="#0b0000", width=random.randint(1, 3), tags="hg_noise"
+            )
+            self._hg_noise_items.append(item)
+        try:
+            self.final_canvas.tag_lower("hg_noise")
+        except Exception:
+            pass
+
+        # Minimal HUD (kept subtle).
+        self._hg_ids["hud"] = self.final_canvas.create_text(
+            20,
+            18,
+            text="",
+            fill="#a30000",
+            font=("Consolas", 14, "bold"),
+            anchor="w",
+            tags="hg",
+        )
+
+        # Kick off loops.
+        self._after_cancel(self._hg_after_tick)
+        self._after_cancel(self._hg_after_fx)
+        self._hg_after_tick = self.root.after(16, self._horror_game_tick)
+        self._hg_after_fx = self.root.after(70, self._horror_game_fx_tick)
+
+        # Sound: short static burst on entry (best-effort).
+        self._play_jumpscare_sound()
+
+    def _hg_spawn_collectible(self) -> None:
+        w = max(1, int(self.screen_w))
+        h = max(1, int(self.screen_h))
+        margin = 80
+        self._hg_collect_x = float(random.randint(margin, max(margin, w - margin)))
+        self._hg_collect_y = float(random.randint(margin, max(margin, h - margin)))
+
+        # Replace previous collectible drawing.
+        for k in ["sigil_a", "sigil_b", "sigil_c"]:
+            item = self._hg_ids.pop(k, None)
+            if item is not None:
+                try:
+                    self.final_canvas.delete(item)  # type: ignore[arg-type]
+                except Exception:
+                    pass
+
+        cx, cy = int(self._hg_collect_x), int(self._hg_collect_y)
+        self._hg_ids["sigil_a"] = self.final_canvas.create_polygon(
+            cx, cy - 14, cx + 14, cy + 12, cx - 14, cy + 12,
+            fill="",
+            outline="#ff0000",
+            width=3,
+            tags="hg",
+        )
+        self._hg_ids["sigil_b"] = self.final_canvas.create_line(
+            cx - 10, cy + 8, cx + 10, cy - 6, fill="#b30000", width=2, tags="hg"
+        )
+        self._hg_ids["sigil_c"] = self.final_canvas.create_oval(
+            cx - 3, cy - 3, cx + 3, cy + 3, fill="#ff0000", outline="#ff0000", tags="hg"
+        )
+
+    def _horror_game_tick(self) -> None:
+        if not self._hg_active:
+            return
+        if self.final_canvas is None or self.final_window is None:
+            return
+        try:
+            if not self.final_canvas.winfo_exists():
+                return
+        except Exception:
+            return
+
+        now = time.monotonic()
+        elapsed = now - self._hg_started_at
+        remaining = max(0.0, self._hg_time_limit_s - elapsed)
+
+        # Player position (cursor).
+        pos = self._get_cursor_pos()
+        if pos is None:
+            pos = self._hg_last_mouse
+        px, py = pos
+        w = max(1, int(self.screen_w))
+        h = max(1, int(self.screen_h))
+        px = max(0, min(int(px), w - 1))
+        py = max(0, min(int(py), h - 1))
+
+        # Enemy chases player; speeds up as you collect sigils / time passes.
+        speed = self._hg_enemy_v + self._hg_score * 0.85 + min(2.4, elapsed * 0.06)
+        dx = float(px) - self._hg_enemy_x
+        dy = float(py) - self._hg_enemy_y
+        dist = max(1.0, (dx * dx + dy * dy) ** 0.5)
+        self._hg_enemy_x += (dx / dist) * speed + random.uniform(-0.25, 0.25)
+        self._hg_enemy_y += (dy / dist) * speed + random.uniform(-0.25, 0.25)
+        self._hg_enemy_x = max(-60.0, min(self._hg_enemy_x, float(w + 60)))
+        self._hg_enemy_y = max(-60.0, min(self._hg_enemy_y, float(h + 60)))
+
+        # Draw updates.
+        try:
+            self.final_canvas.coords(self._hg_ids["player"], px - 6, py - 6, px + 6, py + 6)
+        except Exception:
+            pass
+        ex, ey = int(self._hg_enemy_x), int(self._hg_enemy_y)
+        try:
+            self.final_canvas.coords(self._hg_ids["enemy_outer"], ex - 26, ey - 18, ex + 26, ey + 18)
+            self.final_canvas.coords(self._hg_ids["enemy_iris"], ex - 10, ey - 10, ex + 10, ey + 10)
+            # Pupil follows a bit (makes it feel alive).
+            ox = max(-5.0, min(5.0, dx / dist * 5.0))
+            oy = max(-4.0, min(4.0, dy / dist * 4.0))
+            self.final_canvas.coords(self._hg_ids["enemy_pupil"], ex - 4 + ox, ey - 4 + oy, ex + 4 + ox, ey + 4 + oy)
+        except Exception:
+            pass
+
+        # HUD (subtle).
+        try:
+            self.final_canvas.itemconfig(
+                self._hg_ids["hud"],
+                text=f"{self._hg_score}/{self._hg_target_score}  {remaining:0.1f}s",
+            )
+        except Exception:
+            pass
+
+        # Collision: if the eye touches you, you lose.
+        if dist <= 28.0:
+            self._horror_game_end(win=False, aborted=False)
+            return
+
+        # Collectible pickup.
+        cdx = float(px) - self._hg_collect_x
+        cdy = float(py) - self._hg_collect_y
+        if (cdx * cdx + cdy * cdy) ** 0.5 <= 26.0:
+            self._hg_score += 1
+            # Flash for impact.
+            try:
+                self.final_canvas.configure(bg="#120000")
+            except Exception:
+                pass
+            self._ding()
+            if self._hg_score >= self._hg_target_score:
+                self._horror_game_end(win=True, aborted=False)
+                return
+            self._hg_spawn_collectible()
+
+        # Time out: you lose.
+        if remaining <= 0.0:
+            self._horror_game_end(win=False, aborted=False)
+            return
+
+        self._after_cancel(self._hg_after_tick)
+        self._hg_after_tick = self.root.after(16, self._horror_game_tick)
+
+    def _horror_game_fx_tick(self) -> None:
+        if not self._hg_active or self.final_canvas is None:
+            return
+        try:
+            if not self.final_canvas.winfo_exists():
+                return
+        except Exception:
+            return
+
+        # Noise + flicker.
+        try:
+            bg = "#000000" if random.random() < 0.82 else "#070000"
+            self.final_canvas.configure(bg=bg)
+        except Exception:
+            pass
+        for item in self._hg_noise_items[:]:
+            try:
+                x = random.randint(0, max(1, self.screen_w))
+                y = random.randint(0, max(1, self.screen_h))
+                self.final_canvas.coords(item, x, y, x + random.randint(5, 220), y)
+                self.final_canvas.itemconfig(
+                    item,
+                    fill="#0b0000" if random.random() < 0.7 else "#220000",
+                    width=random.randint(1, 3),
+                )
+            except Exception:
+                continue
+
+        # Random whisper text (short-lived).
+        if random.random() < 0.10:
+            try:
+                tid = self.final_canvas.create_text(
+                    random.randint(60, max(60, self.screen_w - 60)),
+                    random.randint(60, max(60, self.screen_h - 60)),
+                    text=random.choice(["NICHT HINSEHEN", "LAUF", "HINTER DIR", "DU BIST ZU LANGSAM", "NULL"]),
+                    fill="#7f0000",
+                    font=("Consolas", random.randint(18, 34), "bold"),
+                    tags=("hg", "hg_whisper"),
+                )
+                self.root.after(250, lambda: self.final_canvas.delete(tid))
+            except Exception:
+                pass
+
+        self._after_cancel(self._hg_after_fx)
+        self._hg_after_fx = self.root.after(random.randint(60, 120), self._horror_game_fx_tick)
+
+    def _horror_game_end(self, win: bool, aborted: bool) -> None:
+        # Internal helper that can be called from binds without keeping args.
+        self._horror_game_end_impl(win=win, aborted=aborted)
+
+    def _horror_game_end_impl(self, win: bool, aborted: bool) -> None:
+        if not self._hg_active:
+            return
+        self._hg_active = False
+        self._after_cancel(self._hg_after_tick)
+        self._after_cancel(self._hg_after_fx)
+        self._hg_after_tick = None
+        self._hg_after_fx = None
+
+        if self.final_canvas is None or self.final_window is None:
+            self._resurrect_pet()
+            return
+
+        try:
+            self.final_canvas.delete("all")
+            self.final_canvas.configure(bg="black")
+        except Exception:
+            pass
+
+        if aborted:
+            msg = "..."
+            color = "#7f0000"
+        elif win:
+            msg = "DU HAST ES GEFUNDEN."
+            color = "#a30000"
+        else:
+            msg = "ZU SPAET."
+            color = "#ff0000"
+
+        try:
+            self.final_canvas.create_text(
+                self.screen_w // 2,
+                self.screen_h // 2 + 180,
+                text=msg,
+                fill=color,
+                font=("Consolas", 32, "bold"),
+            )
+        except Exception:
+            pass
+
+        if (not win) and (not aborted):
+            # On loss: quick in-place jumpscare.
+            try:
+                img = self._final_bloody_img or self.face_assets.get("mad")
+                if img:
+                    self.final_canvas.create_image(self.screen_w // 2, self.screen_h // 2, image=img)
+            except Exception:
+                pass
+            self._play_jumpscare_sound()
+            self._final_after_resurrect = self.root.after(700, self._resurrect_pet)
+            return
+
+        # On win/abort: short pause then resurrect.
+        self._final_after_resurrect = self.root.after(1200, self._resurrect_pet)
 
     def _show_bloody_ending(self) -> None:
-        if not self.final_canvas.winfo_exists():
+        if self._final_stage != "dots":
             return
+        if self.final_canvas is None or self.final_window is None:
+            return
+        try:
+            if not self.final_canvas.winfo_exists():
+                return
+        except Exception:
+            return
+        self._final_stage = "ending"
+        self._after_cancel(self._final_after_fx)
+        self._final_after_fx = None
+        try:
+            self.final_window.configure(cursor="none")
+        except Exception:
+            pass
         self.final_canvas.delete("dots")
         
         cx = self.screen_w // 2
@@ -1100,27 +1724,37 @@ class AnnoyingBlockPet:
             try:
                 path = self.asset_dir / "Wutend_Bild.png"
                 if path.exists():
-                    pil_img = Image.open(path).convert("RGBA")
+                    with Image.open(path) as _im:  # type: ignore[name-defined]
+                        pil_img = _im.convert("RGBA")
                     r, g, b, a = pil_img.split()
-                    r = r.point(lambda i: i * 1.5) # Boost red
-                    g = g.point(lambda i: i * 0.3) # Reduce green
-                    b = b.point(lambda i: i * 0.3) # Reduce blue
+                    r = r.point(lambda i: min(255, int(i * 1.5)))  # Boost red
+                    g = g.point(lambda i: max(0, int(i * 0.30)))   # Reduce green
+                    b = b.point(lambda i: max(0, int(i * 0.30)))   # Reduce blue
                     pil_img = Image.merge("RGBA", (r, g, b, a))
-                    pil_img = pil_img.resize((256, 256), Image.Resampling.LANCZOS)
+                    resampling = getattr(Image, "Resampling", Image)  # type: ignore[name-defined]
+                    pil_img = pil_img.resize((256, 256), resampling.LANCZOS)
                     self._final_bloody_img = ImageTk.PhotoImage(pil_img)
                     img = self._final_bloody_img
             except Exception:
-                pass
+                self._log_exc("_show_bloody_ending")
         
         if img:
             self.final_canvas.create_image(cx, cy, image=img, tags="face")
             
         self.final_text_idx = 0
         self.final_message = "warum?"
-        self.root.after(2000, self._type_final_message)
+        self._after_cancel(self._final_after_type_msg)
+        self._final_after_type_msg = self.root.after(2000, self._type_final_message)
 
     def _type_final_message(self) -> None:
-        if not self.final_canvas.winfo_exists():
+        if self._final_stage != "ending":
+            return
+        if self.final_canvas is None:
+            return
+        try:
+            if not self.final_canvas.winfo_exists():
+                return
+        except Exception:
             return
             
         if self.final_text_idx < len(self.final_message):
@@ -1134,14 +1768,40 @@ class AnnoyingBlockPet:
             cy = self.screen_h // 2 + 160
             self.final_canvas.create_text(cx, cy, text=current, fill="red", font=("Segoe UI", 28, "bold"), tags="msg")
             
-            self.root.after(600, self._type_final_message)
+            self._after_cancel(self._final_after_type_msg)
+            self._final_after_type_msg = self.root.after(600, self._type_final_message)
         else:
-            self.root.after(10000, self._resurrect_pet)
+            self._after_cancel(self._final_after_resurrect)
+            self._final_after_resurrect = self.root.after(10000, self._resurrect_pet)
 
     def _resurrect_pet(self) -> None:
+        # Stop any pending "final screen" callbacks.
+        self._after_cancel(self._final_after_show_bloody)
+        self._after_cancel(self._final_after_type_msg)
+        self._after_cancel(self._final_after_resurrect)
+        self._after_cancel(self._final_after_fx)
+        self._final_after_show_bloody = None
+        self._final_after_type_msg = None
+        self._final_after_resurrect = None
+        self._final_after_fx = None
+
+        # Stop any horror game loops.
+        self._hg_active = False
+        self._after_cancel(self._hg_after_tick)
+        self._after_cancel(self._hg_after_fx)
+        self._hg_after_tick = None
+        self._hg_after_fx = None
+        self._hg_noise_items = []
+        self._hg_ids = {}
+
+        # Safety: remove any leftover overlay visuals.
+        self._destroy_rope_overlay()
+
         if self.final_window is not None:
             self.final_window.destroy()
             self.final_window = None
+        self.final_canvas = None
+        self._final_stage = "idle"
         
         self.dying = False
         self.scary_mode = True
@@ -1276,7 +1936,7 @@ class AnnoyingBlockPet:
 
         close_btn = tk.Button(
             titlebar,
-            text="✕",
+            text="X",
             command=_on_close,
             bg="#f3f4f6",
             fg="#111827",
@@ -1316,9 +1976,12 @@ class AnnoyingBlockPet:
         
         lbl = tk.Label(win, text=msg, fg="red", bg="black", font=("Segoe UI", random.randint(20, 40), "bold"))
         lbl.pack()
-        
-        x = random.randint(0, self.screen_w - 300)
-        y = random.randint(0, self.screen_h - 100)
+
+        win.update_idletasks()
+        w = max(1, win.winfo_width())
+        h = max(1, win.winfo_height())
+        x = random.randint(0, max(0, self.screen_w - w))
+        y = random.randint(0, max(0, self.screen_h - h))
         win.geometry(f"+{x}+{y}")
         
         # Make it non-interactive and transparent to clicks if possible (simple way: just destroy fast)
@@ -1357,7 +2020,9 @@ class AnnoyingBlockPet:
             # Play directly (async) without thread overhead since data is cached
             winsound.PlaySound(wav_data, winsound.SND_MEMORY | winsound.SND_ASYNC)
         except Exception:
-            pass
+            self._log_once("jumpscare_sound_failed", "Jumpscare sound failed (winsound).")
+            if self.debug_enabled:
+                self._log_exc("_play_jumpscare_sound")
 
     def _get_static_noise(self) -> bytes:
         if self._static_noise_wav is not None:
@@ -1429,19 +2094,7 @@ class AnnoyingBlockPet:
             if random.random() < 0.31:
                 self.vx += random.uniform(-1.0, 1.0)
                 self.vy += random.uniform(-1.0, 1.0)
-            if (
-                now >= self.stunned_until
-                and not self.cursor_heist_active
-                and not self.mouse_lock_active
-                and not self.cursor_pingpong_active
-                and not self.heist_active
-                and not self.window_kill_active
-                and not self.close_attack_active
-                and self.heist_payload_window is None
-                and self.close_prompt_window is None
-                and self.youtube_prompt_window is None
-                and not self.scary_mode
-            ):
+            if self._can_start_major_prank(now, user_active=user_active):
                 if now >= self.next_editor_heist_at:
                     if editor_idle_ok and self._start_editor_heist():
                         if self.notifications_enabled:
@@ -1975,6 +2628,18 @@ class AnnoyingBlockPet:
         if self.youtube_prompt_window is not None and self.youtube_prompt_window.winfo_exists():
             self.youtube_prompt_window.destroy()
         self.youtube_prompt_window = None
+    
+    def _heist_image_target_size(self) -> tuple[int, int]:
+        # Make the "stolen picture" window predictable and keep it within the screen on small displays.
+        # Typical result is 460x300, but it scales down if the screen is tiny.
+        try:
+            sw = int(self.screen_w)
+            sh = int(self.screen_h)
+        except Exception:
+            sw, sh = 1920, 1080
+        w = min(460, max(240, sw - 260))
+        h = min(300, max(180, sh - 300))
+        return (int(w), int(h))
 
     def _start_image_heist(self) -> bool:
         if self.heist_payload_window is not None:
@@ -1983,13 +2648,21 @@ class AnnoyingBlockPet:
             self._log("Image heist: no image paths (yet).")
             return False
         chosen_photo = None
-        for _ in range(10):
+        # Try a few random cached paths. If a file can't be opened/decoded, drop it from the list
+        # so we don't keep hitting the same broken file repeatedly.
+        for _ in range(12):
+            if not self.image_paths:
+                break
             path = random.choice(self.image_paths)
             chosen_photo = self._load_photo(path)
             if chosen_photo is not None:
                 break
+            try:
+                self.image_paths.remove(path)
+            except Exception:
+                pass
         if chosen_photo is None:
-            self._log("Image heist: failed to load any image (10 tries).")
+            self._log("Image heist: failed to load any image (12 tries).")
             return False
 
         self.pending_image_photo = chosen_photo
@@ -2034,6 +2707,53 @@ class AnnoyingBlockPet:
         )
         self.heist_speed = random.uniform(8.0, 11.6)
         return True
+    
+    def _heist_payload_gap(self) -> int:
+        # Space between the cube and the payload window.
+        return 18
+
+    def _heist_payload_pet_bounds(self) -> tuple[float, float, float, float]:
+        # Compute a pet position range where the payload can stay fully on-screen without clamping.
+        pad = 10
+        gap = self._heist_payload_gap()
+        pw = float(self.heist_payload_w)
+        ph = float(self.heist_payload_h)
+
+        x_min = float(pad)
+        x_max = float(max(pad, self.screen_w - self.block_size - pad))
+
+        if self.heist_direction == 1:
+            # Payload is left of the cube.
+            x_min = max(x_min, float(pad + pw + gap))
+        else:
+            # Payload is right of the cube.
+            x_max = min(
+                x_max,
+                float(self.screen_w - pad - self.block_size - gap - pw),
+            )
+
+        y_min = float(pad)
+        y_max = float(max(pad, self.screen_h - self.block_size - pad))
+
+        # payload_y = pet_y + (block_size - payload_h)/2, keep payload fully visible.
+        y_min = max(y_min, float(pad + (ph - self.block_size) / 2.0))
+        y_max = min(y_max, float(self.screen_h - pad - (self.block_size + ph) / 2.0))
+
+        return (x_min, x_max, y_min, y_max)
+
+    def _heist_adjust_target_for_payload(self) -> None:
+        # Once we know payload dimensions, pick a target position that keeps everything visible.
+        x_min, x_max, y_min, y_max = self._heist_payload_pet_bounds()
+
+        if y_max >= y_min:
+            self.y = max(y_min, min(self.y, y_max))
+
+        if x_max >= x_min:
+            self.heist_target_x = float(random.randint(int(x_min), int(x_max)))
+        else:
+            # If the screen is too small to satisfy the constraints, pick the "least bad" position.
+            tx = x_min if self.heist_direction == 1 else x_max
+            self.heist_target_x = float(max(0.0, min(tx, float(self.screen_w - self.block_size))))
 
     def _heist_tick(self) -> None:
         if self.heist_stage == "exit":
@@ -2051,13 +2771,13 @@ class AnnoyingBlockPet:
         if self.heist_stage == "pull":
             self.x += self.heist_direction * self.heist_speed
             self.y += random.uniform(-0.7, 0.7)
-            self.y = max(
-                10.0,
-                min(
-                    self.y,
-                    float(self.screen_h - self.block_size - 10),
-                ),
-            )
+            # Keep payload visible based on its real size.
+            _x_min, _x_max, y_min, y_max = self._heist_payload_pet_bounds()
+            if y_max >= y_min:
+                self.y = max(y_min, min(self.y, y_max))
+            else:
+                # Fallback: old clamp.
+                self.y = max(10.0, min(self.y, float(self.screen_h - self.block_size - 10)))
             self.root.geometry(f"+{int(self.x)}+{int(self.y)}")
             self._position_payload_window()
 
@@ -2065,6 +2785,13 @@ class AnnoyingBlockPet:
                 self.heist_direction == -1 and self.x <= self.heist_target_x
             )
             if reached:
+                # Snap to the final target so the payload doesn't end up slightly misaligned due to overshoot.
+                try:
+                    self.x = float(self.heist_target_x)
+                    self.root.geometry(f"+{int(self.x)}+{int(self.y)}")
+                    self._position_payload_window()
+                except Exception:
+                    pass
                 if self.heist_kind == "editor":
                     now = time.monotonic()
                     self.heist_stage = "linger"
@@ -2136,7 +2863,7 @@ class AnnoyingBlockPet:
             title.pack(side="left", fill="x", expand=True)
             close_btn = tk.Button(
                 titlebar,
-                text="✕",
+                text="X",
                 command=self._on_payload_close,
                 bg="#ef4444",
                 fg="#ffffff",
@@ -2149,8 +2876,18 @@ class AnnoyingBlockPet:
                 font=("Segoe UI", 9, "bold"),
             )
             close_btn.pack(side="right", padx=4, pady=2)
-            label = tk.Label(frame, image=self.pending_image_photo, bg="#0f172a", bd=0)
-            label.pack()
+            img_w, img_h = self._heist_image_target_size()
+            canvas = tk.Canvas(
+                frame,
+                width=img_w,
+                height=img_h,
+                bg="#0f172a",
+                bd=0,
+                highlightthickness=0,
+            )
+            canvas.pack()
+            if self.pending_image_photo is not None:
+                canvas.create_image(img_w // 2, img_h // 2, image=self.pending_image_photo)
             self.heist_image_photo = self.pending_image_photo
             self.pending_image_photo = None
             self.heist_editor_text = None
@@ -2173,7 +2910,7 @@ class AnnoyingBlockPet:
             title.pack(side="left", fill="x", expand=True)
             close_btn = tk.Button(
                 titlebar,
-                text="✕",
+                text="X",
                 command=self._on_payload_close,
                 bg="#f3f4f6",
                 fg="#111827",
@@ -2230,19 +2967,200 @@ class AnnoyingBlockPet:
         self._make_noactivate(win)
         self.heist_payload_w = max(120, win.winfo_width())
         self.heist_payload_h = max(50, win.winfo_height())
+        self._heist_adjust_target_for_payload()
+        self.root.geometry(f"+{int(self.x)}+{int(self.y)}")
         self._position_payload_window()
         self._ding()
 
     def _position_payload_window(self) -> None:
         if self.heist_payload_window is None or not self.heist_payload_window.winfo_exists():
             return
-        payload_x = int(self.x - self.heist_direction * (self.heist_payload_w + 18))
+        gap = self._heist_payload_gap()
+        if self.heist_direction == 1:
+            # Payload trails behind on the left side.
+            payload_x = int(self.x - (self.heist_payload_w + gap))
+        else:
+            # Payload trails behind on the right side.
+            payload_x = int(self.x + self.block_size + gap)
         payload_y = int(self.y + (self.block_size - self.heist_payload_h) / 2)
-        max_x = max(0, self.screen_w - self.heist_payload_w)
+        max_x_on = max(0, self.screen_w - self.heist_payload_w)
         max_y = max(0, self.screen_h - self.heist_payload_h)
-        payload_x = max(0, min(payload_x, max_x))
+
+        # During "pull" allow the payload to start off-screen and slide in, otherwise it looks like it spawns.
+        if self.heist_stage == "pull":
+            min_x = -self.heist_payload_w - 140
+            max_x = self.screen_w + 140
+        else:
+            min_x = 0
+            max_x = max_x_on
+
+        payload_x = max(min_x, min(payload_x, max_x))
         payload_y = max(0, min(payload_y, max_y))
         self.heist_payload_window.geometry(f"+{payload_x}+{payload_y}")
+
+        if self.heist_kind == "image":
+            self._ensure_rope_overlay()
+            self._update_rope(payload_x, payload_y)
+
+    def _destroy_rope_overlay(self) -> None:
+        if self.rope_window is not None:
+            try:
+                if self.rope_window.winfo_exists():
+                    self.rope_window.destroy()
+            except Exception:
+                pass
+        self.rope_window = None
+        self.rope_canvas = None
+        self.rope_line_shadow = None
+        self.rope_line = None
+
+    def _ensure_rope_overlay(self) -> None:
+        # Rope is only shown while pulling an image payload.
+        if self.heist_kind != "image":
+            self._destroy_rope_overlay()
+            return
+        if self.heist_stage != "pull":
+            self._destroy_rope_overlay()
+            return
+        if self.heist_payload_window is None:
+            self._destroy_rope_overlay()
+            return
+
+        if self.rope_window is not None:
+            try:
+                if self.rope_window.winfo_exists():
+                    return
+            except Exception:
+                pass
+            self._destroy_rope_overlay()
+
+        if USER32 is None:
+            # Without USER32 we can't make a fullscreen overlay click-through safely.
+            self._log_once("rope_no_user32", "Rope overlay disabled (USER32 unavailable).")
+            return
+
+        # Transparent overlay window that covers the screen.
+        trans = "#00ff00"
+        try:
+            win = tk.Toplevel(self.root)
+            win.overrideredirect(True)
+            win.attributes("-topmost", True)
+            win.geometry(f"{self.screen_w}x{self.screen_h}+0+0")
+            win.configure(bg=trans)
+
+            # Windows Tk supports transparentcolor; if not, don't risk blocking input.
+            try:
+                win.attributes("-transparentcolor", trans)
+            except Exception:
+                win.destroy()
+                self._log_once("rope_no_transparentcolor", "Rope overlay disabled (-transparentcolor unsupported).")
+                return
+
+            canvas = tk.Canvas(win, bg=trans, highlightthickness=0, bd=0)
+            canvas.pack(fill="both", expand=True)
+
+            shadow = canvas.create_line(
+                0,
+                0,
+                0,
+                0,
+                fill="#000000",
+                width=6,
+                capstyle="round",
+                joinstyle="round",
+                smooth=True,
+                splinesteps=12,
+                tags="rope",
+            )
+            line = canvas.create_line(
+                0,
+                0,
+                0,
+                0,
+                fill="#7f1d1d",
+                width=3,
+                capstyle="round",
+                joinstyle="round",
+                smooth=True,
+                splinesteps=12,
+                tags="rope",
+            )
+
+            self.rope_window = win
+            self.rope_canvas = canvas
+            self.rope_line_shadow = shadow
+            self.rope_line = line
+            self._make_clickthrough(win)
+            # Keep the actual heist windows visually above the rope overlay.
+            try:
+                self.heist_payload_window.lift()
+                self.root.lift()
+            except Exception:
+                pass
+        except Exception:
+            self._destroy_rope_overlay()
+            if self.debug_enabled:
+                self._log_exc("_ensure_rope_overlay")
+
+    def _update_rope(self, payload_x: int, payload_y: int) -> None:
+        if self.rope_canvas is None or self.rope_window is None:
+            return
+        if self.rope_line is None or self.rope_line_shadow is None:
+            return
+        try:
+            if not self.rope_window.winfo_exists():
+                return
+        except Exception:
+            return
+
+        # Keep overlay sized to the current screen cache.
+        try:
+            self.rope_window.geometry(f"{self.screen_w}x{self.screen_h}+0+0")
+        except Exception:
+            pass
+
+        # Rope anchor points.
+        pet_y = float(self.y) + self.block_size / 2.0
+        if self.heist_direction == 1:
+            sx = float(self.x)
+            ex = float(payload_x + self.heist_payload_w)
+        else:
+            sx = float(self.x + self.block_size)
+            ex = float(payload_x)
+        sy = pet_y
+        ey = float(payload_y) + self.heist_payload_h / 2.0
+
+        dx = ex - sx
+        dy = ey - sy
+        dist = max(1.0, (dx * dx + dy * dy) ** 0.5)
+        nx = -dy / dist
+        ny = dx / dist
+
+        # Wavy rope (stronger in the middle, tighter near the ends).
+        tnow = time.monotonic()
+        phase = tnow * 7.0 + self.rope_phase
+        amp = min(22.0, 2.5 + dist * 0.030)
+
+        pts: list[float] = []
+        n = 9
+        for i in range(n):
+            t = i / (n - 1)
+            x = sx + dx * t
+            y = sy + dy * t
+            if 0 < i < n - 1:
+                envelope = math.sin(math.pi * t)
+                w1 = math.sin(phase + t * math.pi * 2.6)
+                w2 = math.sin(phase * 0.7 + t * math.pi * 4.2)
+                wig = (w1 * 0.80 + w2 * 0.20) * amp * envelope
+                x += nx * wig
+                y += ny * wig
+            pts.extend([x, y])
+
+        try:
+            self.rope_canvas.coords(self.rope_line_shadow, *pts)
+            self.rope_canvas.coords(self.rope_line, *pts)
+        except Exception:
+            pass
 
     def _tick_editor_typing(self, now: float) -> None:
         if self.heist_editor_text is None:
@@ -2279,6 +3197,8 @@ class AnnoyingBlockPet:
         self.angry_until = max(self.angry_until, now + 5.0)
 
     def _stop_heist(self, destroy_payload: bool = True) -> None:
+        # Always remove visual overlays when a heist stops.
+        self._destroy_rope_overlay()
         was_active = self.heist_active or self.heist_stage != "idle"
         self.heist_active = False
         self.heist_kind = "image"
@@ -2509,16 +3429,18 @@ class AnnoyingBlockPet:
         target = max(24, self.block_size - 4)
         try:
             if PIL_AVAILABLE:
-                image = Image.open(path).convert("RGBA")  # type: ignore[name-defined]
+                with Image.open(path) as _im:  # type: ignore[name-defined]
+                    pil = ImageOps.exif_transpose(_im)  # type: ignore[name-defined]
+                    image = pil.convert("RGBA")
                 resampling = getattr(Image, "Resampling", Image)  # type: ignore[name-defined]
                 image = image.resize((target, target), resampling.LANCZOS)
                 return ImageTk.PhotoImage(image)  # type: ignore[name-defined]
             photo = tk.PhotoImage(file=str(path))
             w = max(1, photo.width())
             h = max(1, photo.height())
-            factor = max(w / target, h / target, 1)
-            if factor > 1:
-                step = int(factor) + 1
+            factor = max(w / target, h / target, 1.0)
+            if factor > 1.0:
+                step = max(1, int(math.ceil(factor)))
                 photo = photo.subsample(step, step)
             return photo
         except Exception:
@@ -2573,17 +3495,21 @@ class AnnoyingBlockPet:
 
     def _load_photo(self, path: Path):
         try:
+            target_w, target_h = self._heist_image_target_size()
             if PIL_AVAILABLE:
-                image = Image.open(path)  # type: ignore[name-defined]
-                image.thumbnail((460, 300))
+                with Image.open(path) as _im:  # type: ignore[name-defined]
+                    pil = ImageOps.exif_transpose(_im)  # type: ignore[name-defined]
+                    image = pil.convert("RGBA") if pil.mode != "RGBA" else pil.copy()
+                resampling = getattr(Image, "Resampling", Image)  # type: ignore[name-defined]
+                image.thumbnail((target_w, target_h), resample=resampling.LANCZOS)
                 return ImageTk.PhotoImage(image)  # type: ignore[name-defined]
 
             photo = tk.PhotoImage(file=str(path))
             w = max(1, photo.width())
             h = max(1, photo.height())
-            factor = max(w / 460, h / 300, 1)
-            if factor > 1:
-                step = int(factor) + 1
+            factor = max(w / target_w, h / target_h, 1.0)
+            if factor > 1.0:
+                step = max(1, int(math.ceil(factor)))
                 photo = photo.subsample(step, step)
             return photo
         except Exception:
