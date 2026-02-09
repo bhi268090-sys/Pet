@@ -109,6 +109,7 @@ class AnnoyingBlockPet:
         self.heist_editor_typing_until = 0.0
         self.heist_editor_next_type = 0.0
         self.heist_linger_until = 0.0
+        self.angry_until = 0.0
 
         self.emotion = "frech"
         self.confused_until = 0.0
@@ -995,6 +996,7 @@ class AnnoyingBlockPet:
                 and not self.cursor_pingpong_active
                 and not self.heist_active
                 and not self.close_attack_active
+                and self.heist_payload_window is None
                 and self.close_prompt_window is None
                 and self.youtube_prompt_window is None
             ):
@@ -1511,6 +1513,8 @@ class AnnoyingBlockPet:
         self.youtube_prompt_window = None
 
     def _start_image_heist(self) -> bool:
+        if self.heist_payload_window is not None:
+            return False
         if not self.image_paths:
             self._log("Image heist: no image paths (yet).")
             return False
@@ -1546,6 +1550,8 @@ class AnnoyingBlockPet:
         return True
 
     def _start_editor_heist(self) -> bool:
+        if self.heist_payload_window is not None:
+            return False
         self.heist_kind = "editor"
         self.heist_active = True
         self.heist_stage = "exit"
@@ -1598,7 +1604,7 @@ class AnnoyingBlockPet:
                 if self.heist_kind == "editor":
                     now = time.monotonic()
                     self.heist_stage = "linger"
-                    self.heist_linger_until = now + random.uniform(2.8, 5.2)
+                    self.heist_linger_until = now + random.uniform(2.2, 4.0)
                     if random.random() < 0.12:
                         self.heist_editor_typing_until = min(
                             self.heist_linger_until, now + 2.0
@@ -1610,7 +1616,7 @@ class AnnoyingBlockPet:
                     self.vx = 0.0
                     self.vy = 0.0
                 else:
-                    self._stop_heist()
+                    self._stop_heist(destroy_payload=False)
                     self.vx += random.uniform(-2.4, 2.4)
                     self.vy += random.uniform(-2.4, 2.4)
             return
@@ -1621,7 +1627,7 @@ class AnnoyingBlockPet:
             if now < self.heist_editor_typing_until:
                 self._tick_editor_typing(now)
             if now >= self.heist_linger_until:
-                self._stop_heist()
+                self._stop_heist(destroy_payload=False)
                 self.vx += random.uniform(-1.7, 1.7)
                 self.vy += random.uniform(-1.7, 1.7)
 
@@ -1649,36 +1655,95 @@ class AnnoyingBlockPet:
         win.configure(bg="#111111")
 
         if self.heist_kind == "image":
-            frame = tk.Frame(win, bg="#111111", bd=2, relief="solid")
+            frame = tk.Frame(win, bg="#0f172a", bd=2, relief="solid")
             frame.pack(fill="both", expand=True)
-            label = tk.Label(frame, image=self.pending_image_photo, bg="#111111", bd=0)
+            titlebar = tk.Frame(frame, bg="#1f2937")
+            titlebar.pack(fill="x")
+            title = tk.Label(
+                titlebar,
+                text="stolen_picture.png",
+                bg="#1f2937",
+                fg="#f8fafc",
+                font=("Segoe UI", 9, "bold"),
+                anchor="w",
+                padx=8,
+                pady=4,
+            )
+            title.pack(side="left", fill="x", expand=True)
+            close_btn = tk.Button(
+                titlebar,
+                text="✕",
+                command=self._on_payload_close,
+                bg="#ef4444",
+                fg="#ffffff",
+                activebackground="#dc2626",
+                activeforeground="#ffffff",
+                bd=0,
+                relief="flat",
+                padx=6,
+                pady=2,
+                font=("Segoe UI", 9, "bold"),
+            )
+            close_btn.pack(side="right", padx=4, pady=2)
+            label = tk.Label(frame, image=self.pending_image_photo, bg="#0f172a", bd=0)
             label.pack()
             self.heist_image_photo = self.pending_image_photo
             self.pending_image_photo = None
             self.heist_editor_text = None
         else:
-            outer = tk.Frame(win, bg="#0f172a", bd=2, relief="solid")
+            outer = tk.Frame(win, bg="#f3f4f6", bd=2, relief="solid")
             outer.pack(fill="both", expand=True)
 
+            titlebar = tk.Frame(outer, bg="#e5e7eb")
+            titlebar.pack(fill="x")
             title = tk.Label(
-                outer,
-                text="annoying_editor.txt",
-                bg="#1e293b",
-                fg="#cbd5e1",
-                font=("Consolas", 9, "bold"),
+                titlebar,
+                text="annoying_editor.txt - Notepad",
+                bg="#e5e7eb",
+                fg="#111827",
+                font=("Segoe UI", 9, "bold"),
                 anchor="w",
                 padx=8,
                 pady=4,
             )
-            title.pack(fill="x")
+            title.pack(side="left", fill="x", expand=True)
+            close_btn = tk.Button(
+                titlebar,
+                text="✕",
+                command=self._on_payload_close,
+                bg="#f3f4f6",
+                fg="#111827",
+                activebackground="#ef4444",
+                activeforeground="#ffffff",
+                bd=0,
+                relief="flat",
+                padx=6,
+                pady=2,
+                font=("Segoe UI", 9, "bold"),
+            )
+            close_btn.pack(side="right", padx=4, pady=2)
+
+            menubar = tk.Frame(outer, bg="#f8fafc")
+            menubar.pack(fill="x")
+            for label_text in ["File", "Edit", "Format", "View", "Help"]:
+                item = tk.Label(
+                    menubar,
+                    text=label_text,
+                    bg="#f8fafc",
+                    fg="#111827",
+                    font=("Segoe UI", 9),
+                    padx=6,
+                    pady=2,
+                )
+                item.pack(side="left")
 
             text = tk.Text(
                 outer,
                 width=34,
                 height=8,
-                bg="#0b1020",
-                fg="#dbeafe",
-                insertbackground="#dbeafe",
+                bg="#ffffff",
+                fg="#0f172a",
+                insertbackground="#0f172a",
                 font=("Consolas", 10),
                 bd=0,
                 highlightthickness=0,
@@ -1733,11 +1798,8 @@ class AnnoyingBlockPet:
         self.heist_editor_text.see("end")
         self.heist_editor_next_type = now + random.uniform(0.08, 0.20)
 
-    def _stop_heist(self) -> None:
-        self.heist_active = False
-        self.heist_kind = "image"
-        self.heist_stage = "idle"
-        self.pending_image_photo = None
+    def _on_payload_close(self) -> None:
+        self._stop_heist(destroy_payload=False)
         if self.heist_payload_window is not None and self.heist_payload_window.winfo_exists():
             self.heist_payload_window.destroy()
         self.heist_payload_window = None
@@ -1745,6 +1807,28 @@ class AnnoyingBlockPet:
         self.heist_payload_w = 0
         self.heist_payload_h = 0
         self.heist_editor_text = None
+        now = time.monotonic()
+        self.angry_until = max(self.angry_until, now + 3.0)
+        self.cursor_heist_active = True
+        self.cursor_heist_until = max(self.cursor_heist_until, now + 3.0)
+
+    def _stop_heist(self, destroy_payload: bool = True) -> None:
+        was_active = self.heist_active or self.heist_stage != "idle"
+        self.heist_active = False
+        self.heist_kind = "image"
+        self.heist_stage = "idle"
+        self.pending_image_photo = None
+        if destroy_payload and was_active:
+            if (
+                self.heist_payload_window is not None
+                and self.heist_payload_window.winfo_exists()
+            ):
+                self.heist_payload_window.destroy()
+            self.heist_payload_window = None
+            self.heist_image_photo = None
+            self.heist_payload_w = 0
+            self.heist_payload_h = 0
+            self.heist_editor_text = None
         self.heist_editor_typing_until = 0.0
         self.heist_editor_next_type = 0.0
         self.heist_linger_until = 0.0
@@ -1887,7 +1971,7 @@ class AnnoyingBlockPet:
 
     def _update_emotion(self, now: float) -> None:
         target = "frech"
-        if self.close_attack_active or self.cursor_heist_active:
+        if now < self.angry_until or self.close_attack_active or self.cursor_heist_active:
             target = "mad"
         elif self.close_prompt_window is not None:
             target = "silly"
