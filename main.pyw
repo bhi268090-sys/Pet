@@ -15,6 +15,7 @@ except Exception:
 
 try:
     import ctypes
+    from ctypes import wintypes
 
     USER32 = ctypes.windll.user32
     KERNEL32 = ctypes.windll.kernel32
@@ -605,9 +606,18 @@ class AnnoyingBlockPet:
             self._heist_tick()
         elif not self._dragging and not self.ignore_drag_until_release:
             if now >= self.stunned_until:
-                tx, ty = self._choose_target()
-                self._steer_to_target(tx, ty, force=0.42)
-                self._clamp_velocity(self.max_speed)
+                cursor_target = None
+                if now < self.angry_until and USER32 is not None:
+                    cursor_target = self._get_cursor_pos()
+                if cursor_target is not None:
+                    tx = float(cursor_target[0] - self.block_size / 2)
+                    ty = float(cursor_target[1] - self.block_size / 2)
+                    self._steer_to_target(tx, ty, force=0.72)
+                    self._clamp_velocity(self.max_speed + 2.8)
+                else:
+                    tx, ty = self._choose_target()
+                    self._steer_to_target(tx, ty, force=0.42)
+                    self._clamp_velocity(self.max_speed)
                 self._advance_position(allow_offscreen=False)
             else:
                 self.vx *= 0.7
@@ -763,9 +773,21 @@ class AnnoyingBlockPet:
     def _pull_cursor_to_cube(self) -> None:
         if USER32 is None:
             return
+        pos = self._get_cursor_pos()
+        if pos is None:
+            return
+        cx, cy = pos
         target_x = int(self.x + self.block_size / 2 + random.randint(-10, 10))
         target_y = int(self.y + self.block_size / 2 + random.randint(-10, 10))
-        USER32.SetCursorPos(target_x, target_y)
+        dx = target_x - cx
+        dy = target_y - cy
+        dist = max(1.0, (dx * dx + dy * dy) ** 0.5)
+        step = min(26.0, dist * 0.45)
+        nx = int(cx + (dx / dist) * step)
+        ny = int(cy + (dy / dist) * step)
+        nx = max(0, min(nx, self.root.winfo_screenwidth() - 1))
+        ny = max(0, min(ny, self.root.winfo_screenheight() - 1))
+        USER32.SetCursorPos(nx, ny)
 
     def _start_cursor_pingpong(self, now: float) -> None:
         if USER32 is None:
@@ -864,6 +886,14 @@ class AnnoyingBlockPet:
         if self.clone_window is None or not self.clone_window.winfo_exists():
             return self._pet_center()
         return (int(self.clone_x + self.block_size / 2), int(self.clone_y + self.block_size / 2))
+
+    def _get_cursor_pos(self) -> tuple[int, int] | None:
+        if USER32 is None:
+            return None
+        point = wintypes.POINT()
+        if USER32.GetCursorPos(ctypes.byref(point)) == 0:
+            return None
+        return (int(point.x), int(point.y))
 
     def _on_pet_clicked(self) -> None:
         if self.intro_active:
@@ -1774,6 +1804,10 @@ class AnnoyingBlockPet:
             return
         payload_x = int(self.x - self.heist_direction * (self.heist_payload_w + 18))
         payload_y = int(self.y + (self.block_size - self.heist_payload_h) / 2)
+        max_x = max(0, self.root.winfo_screenwidth() - self.heist_payload_w)
+        max_y = max(0, self.root.winfo_screenheight() - self.heist_payload_h)
+        payload_x = max(0, min(payload_x, max_x))
+        payload_y = max(0, min(payload_y, max_y))
         self.heist_payload_window.geometry(f"+{payload_x}+{payload_y}")
 
     def _tick_editor_typing(self, now: float) -> None:
