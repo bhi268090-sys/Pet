@@ -1,6 +1,7 @@
 import math
 import os
 import random
+import struct
 import threading
 import time
 import tkinter as tk
@@ -22,6 +23,11 @@ try:
 except Exception:
     USER32 = None
     KERNEL32 = None
+
+try:
+    import winsound
+except ImportError:
+    winsound = None
 
 
 class AnnoyingBlockPet:
@@ -164,6 +170,10 @@ class AnnoyingBlockPet:
         self.pp_ball_vx = 0.0
         self.pp_ball_vy = 0.0
         self.dying = False
+        self.scary_mode = False
+        self._final_bloody_img = None
+        self.scary_editor_count = 0
+        self._static_noise_wav: bytes | None = None
 
         self.intro_active = True
         self.intro_until = time.monotonic() + 2.9
@@ -190,7 +200,6 @@ class AnnoyingBlockPet:
         self.block.bind("<ButtonRelease-1>", self._stop_drag)
         self.block.bind("<Enter>", self._run_away_from_mouse)
         # Right click: normal close prompt (no trolling).
-        self.block.bind("<Button-3>", self._on_right_click)
         self.block.bind("<ButtonPress-3>", self._on_right_click)
 
         self.root.bind("<Escape>", lambda _event: self.root.destroy())
@@ -305,6 +314,8 @@ class AnnoyingBlockPet:
             raw = self.image_cache_path.read_text(encoding="utf-8", errors="ignore")
             out: list[Path] = []
             exts = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".ppm", ".pgm"}
+            if not PIL_AVAILABLE:
+                exts = {".png", ".gif", ".ppm", ".pgm"}
             for line in raw.splitlines():
                 s = line.strip()
                 if not s:
@@ -337,15 +348,15 @@ class AnnoyingBlockPet:
         self._image_scan_in_progress = True
 
         def worker() -> None:
-            paths = self._collect_image_paths(max_files=max_files)
-            self._save_image_cache(paths)
-
-            def apply() -> None:
-                self.image_paths = paths
-                self._image_scan_in_progress = False
-                self._log(f"Image scan done: {len(paths)} files.")
-
             try:
+                paths = self._collect_image_paths(max_files=max_files)
+                self._save_image_cache(paths)
+
+                def apply() -> None:
+                    self.image_paths = paths
+                    self._image_scan_in_progress = False
+                    self._log(f"Image scan done: {len(paths)} files.")
+
                 self.root.after(0, apply)
             except Exception:
                 self._image_scan_in_progress = False
@@ -412,9 +423,18 @@ class AnnoyingBlockPet:
             self._log("Discord RPC connect failed.")
 
     def _update_discord_rpc(self, force: bool = False) -> None:
+        now = time.monotonic()
+        
+        # Try to reconnect if enabled but not connected
+        if self.discord_rpc_enabled and not self._discord_rpc_connected:
+            if now - self._last_rpc_update_t > 60.0:
+                self._last_rpc_update_t = now
+                self._init_discord_rpc()
+            return
+
         if not self._discord_rpc_connected or self._discord_rpc is None:
             return
-        now = time.monotonic()
+
         if (not force) and (now - self._last_rpc_update_t) < 15.0:
             return
         try:
@@ -633,8 +653,10 @@ class AnnoyingBlockPet:
                     self._clamp_velocity(self.max_speed + 2.8)
                 else:
                     tx, ty = self._choose_target()
-                    self._steer_to_target(tx, ty, force=0.42)
-                    self._clamp_velocity(self.max_speed)
+                    force = 0.9 if self.scary_mode else 0.42
+                    limit = self.max_speed * 1.5 if self.scary_mode else self.max_speed
+                    self._steer_to_target(tx, ty, force=force)
+                    self._clamp_velocity(limit)
                 self._advance_position(allow_offscreen=False)
             else:
                 self.vx *= 0.7
@@ -676,6 +698,10 @@ class AnnoyingBlockPet:
         # Small jitter keeps it alive without looking glitchy.
         self.vx += random.uniform(-0.06, 0.06)
         self.vy += random.uniform(-0.06, 0.06)
+        
+        if self.scary_mode:
+            self.vx += random.uniform(-0.8, 0.8)
+            self.vy += random.uniform(-0.8, 0.8)
 
     def _clamp_velocity(self, limit: float) -> None:
         speed = (self.vx * self.vx + self.vy * self.vy) ** 0.5
@@ -1110,7 +1136,27 @@ class AnnoyingBlockPet:
             
             self.root.after(600, self._type_final_message)
         else:
-            self.root.after(3000, self.root.destroy)
+            self.root.after(10000, self._resurrect_pet)
+
+    def _resurrect_pet(self) -> None:
+        if self.final_window is not None:
+            self.final_window.destroy()
+            self.final_window = None
+        
+        self.dying = False
+        self.scary_mode = True
+        self.root.deiconify()
+        self.root.lift()
+        self.emotion = "scary"
+        self._draw_face()
+        self.x = self.screen_w / 2 - self.block_size / 2
+        self.y = self.screen_h / 2 - self.block_size / 2
+        self.root.geometry(f"+{int(self.x)}+{int(self.y)}")
+        
+        # FIX: Restart the loops that were stopped by dying=True
+        self._motion_loop()
+        self._annoy_loop()
+        self._scary_loop()
 
     def _close_prompt_no(self) -> None:
         self._hide_close_prompt()
@@ -1142,6 +1188,221 @@ class AnnoyingBlockPet:
         tx = max(0, min(tx, self.screen_w - 1))
         ty = max(0, min(ty, self.screen_h - 1))
         USER32.SetCursorPos(tx, ty)
+
+    def _scary_loop(self) -> None:
+        if not self.scary_mode:
+            return
+
+        # Random scary events
+        if random.random() < 0.12:
+            self._scary_teleport()
+        elif random.random() < 0.08:
+            self._spawn_scary_text()
+        elif random.random() < 0.08:
+            self._spawn_scary_editor()
+        elif random.random() < 0.03:
+            self._trigger_jumpscare()
+        elif random.random() < 0.06:
+            self._scary_cursor_glitch()
+
+        # Variable delay for unpredictability
+        delay = random.randint(150, 1200)
+        self.root.after(delay, self._scary_loop)
+
+    def _scary_teleport(self) -> None:
+        # Glitch/Teleport effect
+        max_x = max(0, self.screen_w - self.block_size)
+        max_y = max(0, self.screen_h - self.block_size)
+        
+        # Teleport near current position or completely random
+        if random.random() < 0.7:
+            offset = 200
+            self.x += random.uniform(-offset, offset)
+            self.y += random.uniform(-offset, offset)
+        else:
+            self.x = random.uniform(0, max_x)
+            self.y = random.uniform(0, max_y)
+            
+        self.x = max(0, min(self.x, max_x))
+        self.y = max(0, min(self.y, max_y))
+        self.root.geometry(f"+{int(self.x)}+{int(self.y)}")
+        self.vx = random.uniform(-15, 15)
+        self.vy = random.uniform(-15, 15)
+
+    def _spawn_scary_editor(self, x: int | None = None, y: int | None = None) -> None:
+        if not self.root.winfo_exists() or self.dying:
+            return
+            
+        if self.scary_editor_count > 25:
+            return
+        self.scary_editor_count += 1
+
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.configure(bg="#f3f4f6")
+
+        titlebar = tk.Frame(win, bg="#e5e7eb")
+        titlebar.pack(fill="x")
+        
+        names = ["nicht_schliessen.txt", "hinter_dir.txt", "666.txt", "run.bat", "error.log"]
+        title = tk.Label(
+            titlebar,
+            text=f"{random.choice(names)} - Notepad",
+            bg="#e5e7eb",
+            fg="#111827",
+            font=("Segoe UI", 9, "bold"),
+            anchor="w",
+            padx=8,
+            pady=4,
+        )
+        title.pack(side="left", fill="x", expand=True)
+
+        def _on_close() -> None:
+            try:
+                cx = win.winfo_x()
+                cy = win.winfo_y()
+            except Exception:
+                cx, cy = 0, 0
+            win.destroy()
+            self.scary_editor_count -= 1
+            
+            # Double trouble logic with safety cap
+            if self.scary_editor_count < 15:
+                self._spawn_scary_editor(cx, cy)
+                self._spawn_scary_editor(cx, cy)
+            elif self.scary_editor_count < 25:
+                self._spawn_scary_editor(cx, cy)
+
+        close_btn = tk.Button(
+            titlebar,
+            text="✕",
+            command=_on_close,
+            bg="#f3f4f6",
+            fg="#111827",
+            activebackground="#ef4444",
+            activeforeground="#ffffff",
+            bd=0,
+            relief="flat",
+            padx=6,
+            pady=2,
+            font=("Segoe UI", 9, "bold"),
+        )
+        close_btn.pack(side="right", padx=4, pady=2)
+
+        text = tk.Text(win, width=28, height=6, bg="#ffffff", fg="#0f172a", font=("Consolas", 10), bd=0, highlightthickness=0)
+        text.pack(fill="both", expand=True, padx=6, pady=6)
+        msgs = ["DU KANNST NICHT ENTKOMMEN", "LASS ES", "ICH SEHE DICH", "...", "DONT TOUCH ME", "ERROR 666"]
+        text.insert("end", random.choice(msgs))
+        
+        win.update_idletasks()
+        if x is None: x = random.randint(0, max(0, self.screen_w - win.winfo_width()))
+        if y is None: y = random.randint(0, max(0, self.screen_h - win.winfo_height()))
+        else: x, y = max(0, min(x + random.randint(-50, 50), self.screen_w - win.winfo_width())), max(0, min(y + random.randint(-50, 50), self.screen_h - win.winfo_height()))
+        win.geometry(f"+{x}+{y}")
+        self._make_noactivate(win)
+
+    def _spawn_scary_text(self) -> None:
+        if not self.root.winfo_exists() or self.dying:
+            return
+            
+        messages = ["ICH SEHE DICH", "LAUF", "HILFE", "WARUM?", "NULL", "666", "TOT", "KEIN ENTKOMMEN", "HINTER DIR"]
+        msg = random.choice(messages)
+        
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.configure(bg="black")
+        
+        lbl = tk.Label(win, text=msg, fg="red", bg="black", font=("Segoe UI", random.randint(20, 40), "bold"))
+        lbl.pack()
+        
+        x = random.randint(0, self.screen_w - 300)
+        y = random.randint(0, self.screen_h - 100)
+        win.geometry(f"+{x}+{y}")
+        
+        # Make it non-interactive and transparent to clicks if possible (simple way: just destroy fast)
+        self._make_noactivate(win)
+        
+        # Destroy after short time
+        self.root.after(random.randint(800, 2000), win.destroy)
+
+    def _trigger_jumpscare(self) -> None:
+        # Fullscreen flash of the scary face
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.geometry(f"{self.screen_w}x{self.screen_h}+0+0")
+        win.configure(bg="black")
+        
+        canvas = tk.Canvas(win, bg="black", highlightthickness=0)
+        canvas.pack(fill="both", expand=True)
+        
+        img = self._final_bloody_img or self.face_assets.get("mad")
+        if img:
+            # Center image
+            canvas.create_image(self.screen_w//2, self.screen_h//2, image=img)
+            
+        self._play_jumpscare_sound()
+        # Very short duration
+        self.root.after(150, win.destroy)
+
+    def _play_jumpscare_sound(self) -> None:
+        if winsound is None or not self.sounds_enabled:
+            self._ding()
+            return
+
+        try:
+            wav_data = self._get_static_noise()
+            # Play directly (async) without thread overhead since data is cached
+            winsound.PlaySound(wav_data, winsound.SND_MEMORY | winsound.SND_ASYNC)
+        except Exception:
+            pass
+
+    def _get_static_noise(self) -> bytes:
+        if self._static_noise_wav is not None:
+            return self._static_noise_wav
+            
+        # Generate 0.4s of loud static noise (white noise) once and cache it
+        duration_ms = 400
+        rate = 11025
+        num_samples = int(rate * (duration_ms / 1000.0))
+        
+        wav = bytearray()
+        # RIFF header
+        wav.extend(b'RIFF')
+        wav.extend(struct.pack('<I', 36 + num_samples))
+        wav.extend(b'WAVE')
+        # fmt chunk
+        wav.extend(b'fmt ')
+        wav.extend(struct.pack('<IHHIIHH', 16, 1, 1, rate, rate, 1, 8))
+        # data chunk
+        wav.extend(b'data')
+        wav.extend(struct.pack('<I', num_samples))
+        
+        for _ in range(num_samples):
+            wav.append(random.randint(0, 255))
+            
+        self._static_noise_wav = bytes(wav)
+        return self._static_noise_wav
+
+    def _scary_cursor_glitch(self) -> None:
+        if USER32 is None: return
+        cpos = self._get_cursor_pos()
+        if not cpos: return
+        cx, cy = cpos
+        
+        def _shake(steps: int) -> None:
+            if steps <= 0 or not self.root.winfo_exists() or self.dying:
+                return
+            nx = cx + random.randint(-50, 50)
+            ny = cy + random.randint(-50, 50)
+            nx = max(0, min(nx, self.screen_w))
+            ny = max(0, min(ny, self.screen_h))
+            USER32.SetCursorPos(nx, ny)
+            self.root.after(20, lambda: _shake(steps - 1))
+
+        _shake(5)
 
     def _annoy_loop(self) -> None:
         # Update screen cache
@@ -1179,6 +1440,7 @@ class AnnoyingBlockPet:
                 and self.heist_payload_window is None
                 and self.close_prompt_window is None
                 and self.youtube_prompt_window is None
+                and not self.scary_mode
             ):
                 if now >= self.next_editor_heist_at:
                     if editor_idle_ok and self._start_editor_heist():
@@ -2189,6 +2451,18 @@ class AnnoyingBlockPet:
     def _draw_face(self) -> None:
         self.block.delete("face")
         key = "frech"
+        
+        if self.emotion == "scary":
+            if self._final_bloody_img:
+                self.block.create_image(
+                    self.block_size // 2,
+                    self.block_size // 2,
+                    image=self._final_bloody_img,
+                    tags="face",
+                )
+                return
+            key = "mad"
+
         if self.emotion == "silly":
             key = "silly"
         elif self.emotion == "confused":
@@ -2252,6 +2526,10 @@ class AnnoyingBlockPet:
 
     def _collect_image_paths(self, max_files: int) -> list[Path]:
         exts = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".ppm", ".pgm"}
+        if not PIL_AVAILABLE:
+            # Without PIL, Tkinter only supports PNG, GIF, PPM/PGM reliably
+            exts = {".png", ".gif", ".ppm", ".pgm"}
+            
         search_roots = [
             (Path.home() / "Pictures", 7),
             (Path.home() / "Desktop", 5),
@@ -2261,7 +2539,7 @@ class AnnoyingBlockPet:
 
         found: list[Path] = []
         seen: set[str] = set()
-        skip_dirs = {"node_modules", "venv", ".git", "__pycache__"}
+        skip_dirs = {"node_modules", "venv", ".git", "__pycache__", "$recycle.bin", "system volume information"}
 
         for root, max_depth in search_roots:
             if not root.exists():
