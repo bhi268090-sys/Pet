@@ -46,6 +46,10 @@ class AnnoyingBlockPet:
         self.root.attributes("-topmost", True)
         self.root.configure(bg="black")
 
+        # Optimization: Cache screen dimensions to avoid Tcl calls in loops
+        self.screen_w = self.root.winfo_screenwidth()
+        self.screen_h = self.root.winfo_screenheight()
+
         self._load_settings()
         self._discord_rpc = None
         self._discord_rpc_connected = False
@@ -121,6 +125,10 @@ class AnnoyingBlockPet:
         self.cursor_heist_active = False
         self.cursor_heist_until = 0.0
         # Random short mouse-locks (1-2s), separate from the long "heist" behavior.
+        self.window_kill_active = False
+        self.window_kill_target = (0, 0)
+        self.window_kill_until = 0.0
+        self.next_window_kill_at = 0.0
         self.mouse_lock_active = False
         self.mouse_lock_until = 0.0
         now = time.monotonic()
@@ -152,6 +160,10 @@ class AnnoyingBlockPet:
         self.close_attack_active = False
         self.close_attack_until = 0.0
         self.close_attack_phase = 0.0
+        
+        self.pp_ball_vx = 0.0
+        self.pp_ball_vy = 0.0
+        self.dying = False
 
         self.intro_active = True
         self.intro_until = time.monotonic() + 2.9
@@ -169,15 +181,6 @@ class AnnoyingBlockPet:
         self.clone_vy = 0.0
         self.clone_until = 0.0
         self.clone_face_key = "frech"
-
-        self.shake_score = 0.0
-        self.shake_threshold = 14.0
-        self.shake_cooldown_until = 0.0
-        self.last_drag_sample_t = 0.0
-        self.last_drag_root_x = 0
-        self.last_drag_root_y = 0
-        self.last_drag_dir_x = 0
-        self.last_drag_dir_y = 0
 
         self._draw_face()
         self._show_intro_credit()
@@ -472,11 +475,6 @@ class AnnoyingBlockPet:
         self._press_start_root_x = event.x_root
         self._press_start_root_y = event.y_root
         self._drag_moved_since_press = False
-        self.last_drag_sample_t = 0.0
-        self.last_drag_root_x = event.x_root
-        self.last_drag_root_y = event.y_root
-        self.last_drag_dir_x = 0
-        self.last_drag_dir_y = 0
 
     def _drag_window(self, event) -> None:
         if self.ignore_drag_until_release:
@@ -489,7 +487,6 @@ class AnnoyingBlockPet:
         x = event.x_root - self._drag_offset_x
         y = event.y_root - self._drag_offset_y
         self._move_clamped(x, y)
-        self._track_shake(event)
 
     def _stop_drag(self, event) -> None:
         was_click = (
@@ -500,7 +497,12 @@ class AnnoyingBlockPet:
         )
         self._dragging = False
         self.ignore_drag_until_release = False
-        self.shake_score = 0.0
+
+        # Fix: Prevent instant catch if angry by adding a grace period
+        now = time.monotonic()
+        self.stunned_until = max(self.stunned_until, now + 0.7)
+        self.angry_catch_cooldown_until = max(self.angry_catch_cooldown_until, now + 2.5)
+
         if was_click:
             self._on_pet_clicked()
         else:
@@ -539,8 +541,8 @@ class AnnoyingBlockPet:
                 self._ding()
 
     def _move_clamped(self, x: int, y: int) -> None:
-        max_x = max(0, self.root.winfo_screenwidth() - self.block_size)
-        max_y = max(0, self.root.winfo_screenheight() - self.block_size)
+        max_x = max(0, self.screen_w - self.block_size)
+        max_y = max(0, self.screen_h - self.block_size)
         x = max(0, min(x, max_x))
         y = max(0, min(y, max_y))
         self.x = float(x)
@@ -548,6 +550,8 @@ class AnnoyingBlockPet:
         self.root.geometry(f"+{x}+{y}")
 
     def _motion_loop(self) -> None:
+        if self.dying:
+            return
         now = time.monotonic()
 
         if self.intro_active:
@@ -564,6 +568,9 @@ class AnnoyingBlockPet:
 
         if self.cursor_heist_active and now >= self.cursor_heist_until:
             self.cursor_heist_active = False
+
+        if self.window_kill_active and now >= self.window_kill_until:
+            self.window_kill_active = False
 
         if self.mouse_lock_active and now >= self.mouse_lock_until:
             self.mouse_lock_active = False
@@ -640,6 +647,8 @@ class AnnoyingBlockPet:
             self._whirl_cursor()
         elif self.cursor_heist_active:
             self._pull_cursor_to_cube()
+        elif self.window_kill_active:
+            self._update_window_kill_cursor()
         elif self.mouse_lock_active:
             self._pull_cursor_to_cube()
 
@@ -649,8 +658,8 @@ class AnnoyingBlockPet:
 
     def _choose_target(self) -> tuple[float, float]:
         if self.next_wander_change <= 0 or random.random() < 0.04:
-            max_x = max(0, self.root.winfo_screenwidth() - self.block_size)
-            max_y = max(0, self.root.winfo_screenheight() - self.block_size)
+            max_x = max(0, self.screen_w - self.block_size)
+            max_y = max(0, self.screen_h - self.block_size)
             self.wander_x = random.randint(0, max_x)
             self.wander_y = random.randint(0, max_y)
             self.next_wander_change = random.randint(24, 130)
@@ -683,16 +692,16 @@ class AnnoyingBlockPet:
 
         if allow_offscreen:
             min_x = -self.block_size - 150
-            max_x = self.root.winfo_screenwidth() + 150
+            max_x = self.screen_w + 150
             min_y = -40
-            max_y = self.root.winfo_screenheight() - self.block_size + 40
+            max_y = self.screen_h - self.block_size + 40
             self.x = max(min_x, min(self.x, max_x))
             self.y = max(min_y, min(self.y, max_y))
             self.root.geometry(f"+{int(self.x)}+{int(self.y)}")
             return
 
-        max_x = max(0, self.root.winfo_screenwidth() - self.block_size)
-        max_y = max(0, self.root.winfo_screenheight() - self.block_size)
+        max_x = max(0, self.screen_w - self.block_size)
+        max_y = max(0, self.screen_h - self.block_size)
 
         bounced = False
         if self.x < 0:
@@ -718,59 +727,50 @@ class AnnoyingBlockPet:
 
         self.root.geometry(f"+{int(self.x)}+{int(self.y)}")
 
-    def _track_shake(self, event) -> None:
-        now = time.monotonic()
-        if self.last_drag_sample_t == 0.0:
-            self.last_drag_sample_t = now
-            self.last_drag_root_x = event.x_root
-            self.last_drag_root_y = event.y_root
-            return
+    def _start_window_kill(self) -> bool:
+        if USER32 is None:
+            return False
+        hwnd = USER32.GetForegroundWindow()
+        if not hwnd:
+            return False
+        if hwnd == int(self.root.winfo_id()):
+            return False
+        
+        rect = wintypes.RECT()
+        if USER32.GetWindowRect(hwnd, ctypes.byref(rect)) == 0:
+            return False
+            
+        tx = rect.right - 25
+        ty = rect.top + 15
+        tx = max(0, min(tx, self.screen_w - 5))
+        ty = max(0, min(ty, self.screen_h - 5))
 
-        dt = now - self.last_drag_sample_t
-        if dt <= 0:
-            return
-
-        dx = event.x_root - self.last_drag_root_x
-        dy = event.y_root - self.last_drag_root_y
-        speed = (dx * dx + dy * dy) ** 0.5 / dt
-
-        dir_x = 1 if dx > 8 else -1 if dx < -8 else 0
-        dir_y = 1 if dy > 8 else -1 if dy < -8 else 0
-
-        direction_flip = (
-            (dir_x != 0 and self.last_drag_dir_x != 0 and dir_x != self.last_drag_dir_x)
-            or (dir_y != 0 and self.last_drag_dir_y != 0 and dir_y != self.last_drag_dir_y)
-        )
-
-        self.shake_score *= 0.92
-        if direction_flip and speed > 850:
-            self.shake_score += min(6.0, speed / 480.0)
-        elif speed > 1200:
-            self.shake_score += 0.8
-
-        if now > self.shake_cooldown_until and self.shake_score >= self.shake_threshold:
-            self._trigger_shake_revenge(now)
-
-        self.last_drag_sample_t = now
-        self.last_drag_root_x = event.x_root
-        self.last_drag_root_y = event.y_root
-        if dir_x != 0:
-            self.last_drag_dir_x = dir_x
-        if dir_y != 0:
-            self.last_drag_dir_y = dir_y
-
-    def _trigger_shake_revenge(self, now: float) -> None:
-        self._stop_heist()
-        self._dragging = False
-        self.ignore_drag_until_release = True
-        self.shake_score = 0.0
-        self.shake_cooldown_until = now + 10.0
-        self.stunned_until = now + 1.1
-        self.confused_until = max(self.confused_until, self.stunned_until)
-        self.vx = 0.0
-        self.vy = 0.0
+        self.window_kill_target = (tx, ty)
+        self.window_kill_active = True
+        self.window_kill_until = time.monotonic() + 3.5
         self._ding()
-        self.root.after(1150, self._start_cursor_heist)
+        return True
+
+    def _update_window_kill_cursor(self) -> None:
+        if USER32 is None: return
+        cpos = self._get_cursor_pos()
+        if not cpos: return
+        cx, cy = cpos
+        tx, ty = self.window_kill_target
+        dx, dy = tx - cx, ty - cy
+        dist = (dx * dx + dy * dy) ** 0.5
+        
+        if dist < 15.0:
+            USER32.SetCursorPos(tx, ty)
+            USER32.mouse_event(0x0002, 0, 0, 0, 0) # Down
+            USER32.mouse_event(0x0004, 0, 0, 0, 0) # Up
+            self.window_kill_active = False
+            self.angry_until = time.monotonic() + 1.5
+        else:
+            step = min(45.0, dist * 0.55)
+            nx = int(cx + (dx / dist) * step)
+            ny = int(cy + (dy / dist) * step)
+            USER32.SetCursorPos(nx, ny)
 
     def _start_angry_catch(self, now: float) -> None:
         if self.cursor_heist_active:
@@ -808,8 +808,8 @@ class AnnoyingBlockPet:
         step = min(26.0, dist * 0.45)
         nx = int(cx + (dx / dist) * step)
         ny = int(cy + (dy / dist) * step)
-        nx = max(0, min(nx, self.root.winfo_screenwidth() - 1))
-        ny = max(0, min(ny, self.root.winfo_screenheight() - 1))
+        nx = max(0, min(nx, self.screen_w - 1))
+        ny = max(0, min(ny, self.screen_h - 1))
         USER32.SetCursorPos(nx, ny)
 
     def _start_cursor_pingpong(self, now: float) -> None:
@@ -830,77 +830,123 @@ class AnnoyingBlockPet:
         if self.clone_window is None:
             self._spawn_clone(now)
         # Make sure the clone doesn't instantly vanish right after ping-pong ends.
-        self.clone_until = max(self.clone_until, now + 13.0)
+        self.clone_until = max(self.clone_until, now + 25.0)
 
         self.cursor_pingpong_active = True
-        self.cursor_pingpong_until = now + 12.0
-        self._cursor_pingpong_start_t = now
-        self._cursor_pingpong_phase_a = random.uniform(0.0, 6.283185307179586)
-        self._cursor_pingpong_phase_b = random.uniform(0.0, 6.283185307179586)
-        self._cursor_pingpong_leg_t0 = now
-        self._cursor_pingpong_target_is_clone = True
-        self._cursor_pingpong_from = self._pet_center()
-        self._cursor_pingpong_to = self._clone_center_or_pet()
+        self.cursor_pingpong_until = now + 20.0
+        
+        # Setup "Real" Ping Pong
+        # 1. Position Pets at edges
+        self.x = 10.0
+        self.y = self.screen_h / 2 - self.block_size / 2
+        self.root.geometry(f"+{int(self.x)}+{int(self.y)}")
+        
+        if self.clone_window is not None:
+            self.clone_x = float(self.screen_w - self.block_size - 10)
+            self.clone_y = self.screen_h / 2 - self.block_size / 2
+            self.clone_window.geometry(f"+{int(self.clone_x)}+{int(self.clone_y)}")
+
+        # 2. Launch Ball (Cursor) from center
+        start_x = self.screen_w // 2
+        start_y = self.screen_h // 2
+        USER32.SetCursorPos(start_x, start_y)
+        
+        # Random velocity
+        speed = random.uniform(10.0, 15.0)
+        angle = random.uniform(-0.6, 0.6) # radians
+        if random.random() < 0.5:
+            angle += math.pi
+        
+        self.pp_ball_vx = math.cos(angle) * speed
+        self.pp_ball_vy = math.sin(angle) * speed
 
     def _pingpong_move_pets(self, now: float) -> None:
-        # Computed motion: two "paddles" on opposite sides, moving smoothly.
-        max_x = max(0, self.root.winfo_screenwidth() - self.block_size)
-        max_y = max(0, self.root.winfo_screenheight() - self.block_size)
-        margin = 10
-        left_x = max(0, min(margin, max_x))
-        right_x = max(0, min(max_x - margin, max_x))
-
-        t = max(0.0, now - self._cursor_pingpong_start_t)
-
-        y_range = max(1, max_y - 2 * margin)
-        # Roughly ~1.6s per cycle.
-        omega = (2.0 * math.pi) / 1.6
-        y_a = margin + (0.5 + 0.5 * math.sin(omega * t + self._cursor_pingpong_phase_a)) * y_range
-        y_b = margin + (0.5 + 0.5 * math.sin(omega * t + self._cursor_pingpong_phase_b)) * y_range
-
-        # Small in/out wiggle so it doesn't look glued to the edge.
-        wiggle = 12.0
-        wiggle_omega = (2.0 * math.pi) / 0.9
-        x_a = float(left_x) + wiggle * (0.5 + 0.5 * math.sin(wiggle_omega * t))
-        x_b = float(right_x) - wiggle * (0.5 + 0.5 * math.sin(wiggle_omega * t + math.pi))
-
-        self.x = float(max(0, min(x_a, max_x)))
-        self.y = float(max(0, min(y_a, max_y)))
+        # AI Logic: Paddles follow the ball (cursor)
+        cpos = self._get_cursor_pos()
+        if not cpos:
+            return
+        _, cy = cpos
+        
+        target_y = cy - self.block_size / 2
+        speed_limit = 14.0 
+        
+        # Move Main Pet (Left)
+        dy = target_y - self.y
+        if abs(dy) > speed_limit:
+            self.y += speed_limit if dy > 0 else -speed_limit
+        else:
+            self.y = target_y
+            
+        max_y = max(0, self.screen_h - self.block_size)
+        self.y = max(0.0, min(self.y, float(max_y)))
+        self.x = 10.0
         self.root.geometry(f"+{int(self.x)}+{int(self.y)}")
 
+        # Move Clone (Right)
         if self.clone_window is not None and self.clone_window.winfo_exists():
-            self.clone_x = float(max(0, min(x_b, max_x)))
-            self.clone_y = float(max(0, min(y_b, max_y)))
+            dy_clone = target_y - self.clone_y
+            if abs(dy_clone) > speed_limit:
+                self.clone_y += speed_limit if dy_clone > 0 else -speed_limit
+            else:
+                self.clone_y = target_y
+            
+            self.clone_y = max(0.0, min(self.clone_y, float(max_y)))
+            self.clone_x = float(self.screen_w - self.block_size - 10)
             self.clone_window.geometry(f"+{int(self.clone_x)}+{int(self.clone_y)}")
 
     def _pingpong_cursor(self, now: float) -> None:
         if USER32 is None:
             return
 
-        if self.clone_window is None or not self.clone_window.winfo_exists():
-            self._pull_cursor_to_cube()
+        cpos = self._get_cursor_pos()
+        if not cpos:
             return
+        cx, cy = cpos
 
-        t = (now - self._cursor_pingpong_leg_t0) / max(0.01, self._cursor_pingpong_leg_dt)
-        if t >= 1.0:
-            self._cursor_pingpong_leg_t0 = now
-            self._cursor_pingpong_from = self._cursor_pingpong_to
-            self._cursor_pingpong_target_is_clone = not self._cursor_pingpong_target_is_clone
-            self._cursor_pingpong_to = (
-                self._clone_center_or_pet() if self._cursor_pingpong_target_is_clone else self._pet_center()
-            )
-            t = 0.0
+        # Physics Step
+        nx = cx + self.pp_ball_vx
+        ny = cy + self.pp_ball_vy
 
-        # Ease in/out so it feels like "pong" instead of a hard teleport.
-        t2 = t * t * (3.0 - 2.0 * t)
-        fx, fy = self._cursor_pingpong_from
-        tx, ty = self._cursor_pingpong_to
-        x = int(fx + (tx - fx) * t2)
-        y = int(fy + (ty - fy) * t2)
+        # Bounce Top/Bottom
+        if ny <= 0:
+            ny = 0
+            self.pp_ball_vy = abs(self.pp_ball_vy)
+        elif ny >= self.screen_h - 1:
+            ny = self.screen_h - 1
+            self.pp_ball_vy = -abs(self.pp_ball_vy)
 
-        x = max(0, min(x, self.root.winfo_screenwidth() - 1))
-        y = max(0, min(y, self.root.winfo_screenheight() - 1))
-        USER32.SetCursorPos(x, y)
+        # Paddle Collision
+        # Pet (Left)
+        if nx < self.x + self.block_size:
+            if self.y - 10 < ny < self.y + self.block_size + 10:
+                nx = self.x + self.block_size + 5
+                self.pp_ball_vx = abs(self.pp_ball_vx) * 1.05
+                offset = (ny - (self.y + self.block_size / 2)) / (self.block_size / 2)
+                self.pp_ball_vy += offset * 3.0
+                self._ding()
+
+        # Clone (Right)
+        if self.clone_window is not None and self.clone_window.winfo_exists():
+            if nx > self.clone_x:
+                if self.clone_y - 10 < ny < self.clone_y + self.block_size + 10:
+                    nx = self.clone_x - 5
+                    self.pp_ball_vx = -abs(self.pp_ball_vx) * 1.05
+                    offset = (ny - (self.clone_y + self.block_size / 2)) / (self.block_size / 2)
+                    self.pp_ball_vy += offset * 3.0
+                    self._ding()
+
+        # Score / Reset
+        if nx < -50 or nx > self.screen_w + 50:
+            nx = self.screen_w // 2
+            ny = self.screen_h // 2
+            speed = random.uniform(10.0, 15.0)
+            angle = random.uniform(-0.6, 0.6)
+            if random.random() < 0.5:
+                angle += math.pi
+            self.pp_ball_vx = math.cos(angle) * speed
+            self.pp_ball_vy = math.sin(angle) * speed
+
+        USER32.SetCursorPos(int(nx), int(ny))
 
     def _pet_center(self) -> tuple[int, int]:
         return (int(self.x + self.block_size / 2), int(self.y + self.block_size / 2))
@@ -978,8 +1024,8 @@ class AnnoyingBlockPet:
         win.update_idletasks()
         px = int(self.x + self.block_size + 10)
         py = int(self.y - 10)
-        max_x = max(0, self.root.winfo_screenwidth() - win.winfo_width())
-        max_y = max(0, self.root.winfo_screenheight() - win.winfo_height())
+        max_x = max(0, self.screen_w - win.winfo_width())
+        max_y = max(0, self.screen_h - win.winfo_height())
         px = max(0, min(px, max_x))
         py = max(0, min(py, max_y))
         win.geometry(f"+{px}+{py}")
@@ -989,8 +1035,82 @@ class AnnoyingBlockPet:
 
     def _close_prompt_yes(self) -> None:
         self._hide_close_prompt()
-        # "Ohne troll": actually close.
-        self.root.destroy()
+        self._start_final_sequence()
+
+    def _start_final_sequence(self) -> None:
+        self.dying = True
+        self.root.withdraw()
+        
+        self.final_window = tk.Toplevel(self.root)
+        self.final_window.configure(bg="black", cursor="none")
+        self.final_window.geometry(f"{self.screen_w}x{self.screen_h}+0+0")
+        self.final_window.overrideredirect(True)
+        self.final_window.attributes("-topmost", True)
+        
+        self.final_canvas = tk.Canvas(self.final_window, bg="black", highlightthickness=0)
+        self.final_canvas.pack(fill="both", expand=True)
+        
+        cx = self.screen_w // 2
+        cy = self.screen_h // 2
+        r = 25
+        gap = 90
+        for i in range(-1, 2):
+            x = cx + i * gap
+            self.final_canvas.create_oval(x - r, cy - r, x + r, cy + r, fill="#ff0000", outline="#ff0000", tags="dots")
+            
+        self.root.after(10000, self._show_bloody_ending)
+
+    def _show_bloody_ending(self) -> None:
+        if not self.final_canvas.winfo_exists():
+            return
+        self.final_canvas.delete("dots")
+        
+        cx = self.screen_w // 2
+        cy = self.screen_h // 2
+        
+        # Try to create a "bloody" version if PIL is available, else use mad face
+        img = self.face_assets.get("mad")
+        if PIL_AVAILABLE and img:
+            try:
+                path = self.asset_dir / "Wutend_Bild.png"
+                if path.exists():
+                    pil_img = Image.open(path).convert("RGBA")
+                    r, g, b, a = pil_img.split()
+                    r = r.point(lambda i: i * 1.5) # Boost red
+                    g = g.point(lambda i: i * 0.3) # Reduce green
+                    b = b.point(lambda i: i * 0.3) # Reduce blue
+                    pil_img = Image.merge("RGBA", (r, g, b, a))
+                    pil_img = pil_img.resize((256, 256), Image.Resampling.LANCZOS)
+                    self._final_bloody_img = ImageTk.PhotoImage(pil_img)
+                    img = self._final_bloody_img
+            except Exception:
+                pass
+        
+        if img:
+            self.final_canvas.create_image(cx, cy, image=img, tags="face")
+            
+        self.final_text_idx = 0
+        self.final_message = "warum?"
+        self.root.after(2000, self._type_final_message)
+
+    def _type_final_message(self) -> None:
+        if not self.final_canvas.winfo_exists():
+            return
+            
+        if self.final_text_idx < len(self.final_message):
+            char = self.final_message[self.final_text_idx]
+            self.final_text_idx += 1
+            
+            current = self.final_message[:self.final_text_idx]
+            self.final_canvas.delete("msg")
+            
+            cx = self.screen_w // 2
+            cy = self.screen_h // 2 + 160
+            self.final_canvas.create_text(cx, cy, text=current, fill="red", font=("Segoe UI", 28, "bold"), tags="msg")
+            
+            self.root.after(600, self._type_final_message)
+        else:
+            self.root.after(3000, self.root.destroy)
 
     def _close_prompt_no(self) -> None:
         self._hide_close_prompt()
@@ -1019,11 +1139,17 @@ class AnnoyingBlockPet:
         ty = int(cy + radius * math.sin(self.close_attack_phase))
         tx += random.randint(-18, 18)
         ty += random.randint(-18, 18)
-        tx = max(0, min(tx, self.root.winfo_screenwidth() - 1))
-        ty = max(0, min(ty, self.root.winfo_screenheight() - 1))
+        tx = max(0, min(tx, self.screen_w - 1))
+        ty = max(0, min(ty, self.screen_h - 1))
         USER32.SetCursorPos(tx, ty)
 
     def _annoy_loop(self) -> None:
+        # Update screen cache
+        self.screen_w = self.root.winfo_screenwidth()
+        self.screen_h = self.root.winfo_screenheight()
+
+        if self.dying:
+            return
         now = time.monotonic()
         idle_s = self._user_idle_seconds() if self.respect_user_input else 9999.0
         user_active = idle_s < self.active_grace_s
@@ -1048,6 +1174,7 @@ class AnnoyingBlockPet:
                 and not self.mouse_lock_active
                 and not self.cursor_pingpong_active
                 and not self.heist_active
+                and not self.window_kill_active
                 and not self.close_attack_active
                 and self.heist_payload_window is None
                 and self.close_prompt_window is None
@@ -1075,6 +1202,26 @@ class AnnoyingBlockPet:
                 if random.random() < 0.20:
                     self.confused_until = now + random.uniform(0.6, 1.4)
 
+        # Separate Window Kill Logic (More frequent, less strict on idle)
+        if (
+            not self.intro_active
+            and not self._dragging
+            and now >= self.stunned_until
+            and not self.window_kill_active
+            and not self.heist_active
+            and not self.cursor_heist_active
+            and not self.close_attack_active
+            and self.close_prompt_window is None
+            and self.youtube_prompt_window is None
+            and self.discord_prompt_window is None
+            and USER32 is not None
+            and now >= self.next_window_kill_at
+            and now >= self.angry_until
+        ):
+            if random.random() < 0.15:
+                if self._start_window_kill():
+                    self.next_window_kill_at = now + random.uniform(15.0, 45.0)
+
         if (
             not self.intro_active
             and not self._dragging
@@ -1082,6 +1229,7 @@ class AnnoyingBlockPet:
             and self.close_prompt_window is None
             and self.youtube_prompt_window is None
             and not self.heist_active
+            and not self.window_kill_active
             and not self.cursor_heist_active
             and not self.cursor_pingpong_active
             and not self.close_attack_active
@@ -1383,8 +1531,8 @@ class AnnoyingBlockPet:
         win.update_idletasks()
         px = int(self.x + self.block_size + 10)
         py = int(self.y + self.block_size // 2 - win.winfo_height() // 2)
-        max_x = max(0, self.root.winfo_screenwidth() - win.winfo_width())
-        max_y = max(0, self.root.winfo_screenheight() - win.winfo_height())
+        max_x = max(0, self.screen_w - win.winfo_width())
+        max_y = max(0, self.screen_h - win.winfo_height())
         px = max(0, min(px, max_x))
         py = max(0, min(py, max_y))
         win.geometry(f"+{px}+{py}")
@@ -1469,10 +1617,10 @@ class AnnoyingBlockPet:
 
         win.update_idletasks()
         # Put the prompt near the center so it's easy to type into.
-        px = int(self.root.winfo_screenwidth() * 0.5 - win.winfo_width() * 0.5)
-        py = int(self.root.winfo_screenheight() * 0.5 - win.winfo_height() * 0.5)
-        px = max(0, min(px, self.root.winfo_screenwidth() - win.winfo_width()))
-        py = max(0, min(py, self.root.winfo_screenheight() - win.winfo_height()))
+        px = int(self.screen_w * 0.5 - win.winfo_width() * 0.5)
+        py = int(self.screen_h * 0.5 - win.winfo_height() * 0.5)
+        px = max(0, min(px, self.screen_w - win.winfo_width()))
+        py = max(0, min(py, self.screen_h - win.winfo_height()))
         win.geometry(f"+{px}+{py}")
 
         self.discord_prompt_window = win
@@ -1549,8 +1697,8 @@ class AnnoyingBlockPet:
         win.update_idletasks()
         px = int(self.x + self.block_size + 10)
         py = int(self.y - 10)
-        max_x = max(0, self.root.winfo_screenwidth() - win.winfo_width())
-        max_y = max(0, self.root.winfo_screenheight() - win.winfo_height())
+        max_x = max(0, self.screen_w - win.winfo_width())
+        max_y = max(0, self.screen_h - win.winfo_height())
         px = max(0, min(px, max_x))
         py = max(0, min(py, max_y))
         win.geometry(f"+{px}+{py}")
@@ -1591,14 +1739,14 @@ class AnnoyingBlockPet:
         self.heist_exit_x = (
             -self.block_size - 60
             if self.heist_direction == 1
-            else self.root.winfo_screenwidth() + 60
+            else self.screen_w + 60
         )
         self.heist_exit_y = random.randint(
-            20, max(30, self.root.winfo_screenheight() - self.block_size - 20)
+            20, max(30, self.screen_h - self.block_size - 20)
         )
         self.heist_target_x = random.randint(
-            int(self.root.winfo_screenwidth() * 0.25),
-            int(self.root.winfo_screenwidth() * 0.75),
+            int(self.screen_w * 0.25),
+            int(self.screen_w * 0.75),
         )
         self.heist_speed = random.uniform(8.8, 13.0)
         return True
@@ -1613,14 +1761,14 @@ class AnnoyingBlockPet:
         self.heist_exit_x = (
             -self.block_size - 60
             if self.heist_direction == 1
-            else self.root.winfo_screenwidth() + 60
+            else self.screen_w + 60
         )
         self.heist_exit_y = random.randint(
-            20, max(30, self.root.winfo_screenheight() - self.block_size - 20)
+            20, max(30, self.screen_h - self.block_size - 20)
         )
         self.heist_target_x = random.randint(
-            int(self.root.winfo_screenwidth() * 0.23),
-            int(self.root.winfo_screenwidth() * 0.76),
+            int(self.screen_w * 0.23),
+            int(self.screen_w * 0.76),
         )
         self.heist_speed = random.uniform(8.0, 11.6)
         return True
@@ -1632,7 +1780,7 @@ class AnnoyingBlockPet:
             self._advance_position(allow_offscreen=True)
             gone = (self.heist_direction == 1 and self.x <= -self.block_size - 10) or (
                 self.heist_direction == -1
-                and self.x >= self.root.winfo_screenwidth() + 10
+                and self.x >= self.screen_w + 10
             )
             if gone:
                 self._begin_pull_stage()
@@ -1645,7 +1793,7 @@ class AnnoyingBlockPet:
                 10.0,
                 min(
                     self.y,
-                    float(self.root.winfo_screenheight() - self.block_size - 10),
+                    float(self.screen_h - self.block_size - 10),
                 ),
             )
             self.root.geometry(f"+{int(self.x)}+{int(self.y)}")
@@ -1698,7 +1846,7 @@ class AnnoyingBlockPet:
         self.x = (
             -self.block_size - 20
             if self.heist_direction == 1
-            else self.root.winfo_screenwidth() + 20
+            else self.screen_w + 20
         )
         self.vx = 0.0
         self.vy = 0.0
@@ -1828,8 +1976,8 @@ class AnnoyingBlockPet:
             return
         payload_x = int(self.x - self.heist_direction * (self.heist_payload_w + 18))
         payload_y = int(self.y + (self.block_size - self.heist_payload_h) / 2)
-        max_x = max(0, self.root.winfo_screenwidth() - self.heist_payload_w)
-        max_y = max(0, self.root.winfo_screenheight() - self.heist_payload_h)
+        max_x = max(0, self.screen_w - self.heist_payload_w)
+        max_y = max(0, self.screen_h - self.heist_payload_h)
         payload_x = max(0, min(payload_x, max_x))
         payload_y = max(0, min(payload_y, max_y))
         self.heist_payload_window.geometry(f"+{payload_x}+{payload_y}")
@@ -1911,8 +2059,8 @@ class AnnoyingBlockPet:
         win.update_idletasks()
         x = int(self.x + self.block_size + 14)
         y = int(self.y - 2)
-        max_x = max(0, self.root.winfo_screenwidth() - win.winfo_width())
-        max_y = max(0, self.root.winfo_screenheight() - win.winfo_height())
+        max_x = max(0, self.screen_w - win.winfo_width())
+        max_y = max(0, self.screen_h - win.winfo_height())
         x = max(0, min(x, max_x))
         y = max(0, min(y, max_y))
         win.geometry(f"+{x}+{y}")
@@ -1963,8 +2111,8 @@ class AnnoyingBlockPet:
                 tags="face",
             )
 
-        max_x = max(0, self.root.winfo_screenwidth() - self.block_size)
-        max_y = max(0, self.root.winfo_screenheight() - self.block_size)
+        max_x = max(0, self.screen_w - self.block_size)
+        max_y = max(0, self.screen_h - self.block_size)
         self.clone_x = float(max(0, min(int(self.x + random.randint(-140, 140)), max_x)))
         self.clone_y = float(max(0, min(int(self.y + random.randint(-120, 120)), max_y)))
         self.clone_vx = random.choice([-1.0, 1.0]) * random.uniform(3.0, 6.5)
@@ -1988,8 +2136,8 @@ class AnnoyingBlockPet:
         self.clone_x += self.clone_vx
         self.clone_y += self.clone_vy
 
-        max_x = max(0, self.root.winfo_screenwidth() - self.block_size)
-        max_y = max(0, self.root.winfo_screenheight() - self.block_size)
+        max_x = max(0, self.screen_w - self.block_size)
+        max_y = max(0, self.screen_h - self.block_size)
 
         bounced = False
         if self.clone_x < 0:
@@ -2027,7 +2175,7 @@ class AnnoyingBlockPet:
 
     def _update_emotion(self, now: float) -> None:
         target = "frech"
-        if now < self.angry_until or self.close_attack_active or self.cursor_heist_active:
+        if now < self.angry_until or self.close_attack_active or self.cursor_heist_active or self.window_kill_active:
             target = "mad"
         elif self.close_prompt_window is not None:
             target = "silly"
