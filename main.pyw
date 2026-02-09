@@ -33,7 +33,7 @@ class AnnoyingBlockPet:
         # - CUBEPET_ACTIVE_GRACE_S=1.2 sets "user active" threshold (seconds)
         # - CUBEPET_NOTIFICATIONS=0 disables Windows notifications (default on)
         # - CUBEPET_IMAGE_IDLE_S=0.05 minimum idle seconds for image-heist (default 0.05)
-        # - CUBEPET_IMAGE_MIN_S=8 / CUBEPET_IMAGE_MAX_S=18 image-heist window (seconds)
+        # - CUBEPET_IMAGE_MIN_S=10 / CUBEPET_IMAGE_MAX_S=22 image-heist window (seconds)
         # - CUBEPET_DISCORD_RPC=1 enables Discord Rich Presence (default off)
         # - CUBEPET_DISCORD_RPC_CLIENT_ID=... required for Discord RPC
         self.asset_dir = Path(__file__).resolve().parent
@@ -111,6 +111,7 @@ class AnnoyingBlockPet:
         self.heist_editor_next_type = 0.0
         self.heist_linger_until = 0.0
         self.angry_until = 0.0
+        self.angry_catch_cooldown_until = 0.0
 
         self.emotion = "frech"
         self.confused_until = 0.0
@@ -261,8 +262,8 @@ class AnnoyingBlockPet:
         self.image_idle_s = self._env_float("CUBEPET_IMAGE_IDLE_S", default=0.05)
         if self.image_idle_s < 0.0:
             self.image_idle_s = 0.0
-        self.image_min_s = self._env_float("CUBEPET_IMAGE_MIN_S", default=8.0)
-        self.image_max_s = self._env_float("CUBEPET_IMAGE_MAX_S", default=18.0)
+        self.image_min_s = self._env_float("CUBEPET_IMAGE_MIN_S", default=10.0)
+        self.image_max_s = self._env_float("CUBEPET_IMAGE_MAX_S", default=22.0)
         if self.image_min_s < 2.0:
             self.image_min_s = 2.0
         if self.image_max_s < self.image_min_s:
@@ -612,6 +613,15 @@ class AnnoyingBlockPet:
                 if cursor_target is not None:
                     tx = float(cursor_target[0] - self.block_size / 2)
                     ty = float(cursor_target[1] - self.block_size / 2)
+                    if now >= self.angry_catch_cooldown_until:
+                        cx = self.x + self.block_size / 2
+                        cy = self.y + self.block_size / 2
+                        dx = cursor_target[0] - cx
+                        dy = cursor_target[1] - cy
+                        if (dx * dx + dy * dy) ** 0.5 <= 22.0:
+                            self._start_angry_catch(now)
+                            cursor_target = None
+                if cursor_target is not None:
                     self._steer_to_target(tx, ty, force=0.72)
                     self._clamp_velocity(self.max_speed + 2.8)
                 else:
@@ -761,6 +771,19 @@ class AnnoyingBlockPet:
         self.vy = 0.0
         self._ding()
         self.root.after(1150, self._start_cursor_heist)
+
+    def _start_angry_catch(self, now: float) -> None:
+        if self.cursor_heist_active:
+            return
+        self.cursor_heist_active = True
+        self.cursor_heist_until = max(self.cursor_heist_until, now + 6.0)
+        self.angry_until = 0.0
+        self.angry_catch_cooldown_until = now + 0.6
+        self.mouse_lock_active = False
+        self.vx += random.choice([-1.0, 1.0]) * random.uniform(2.6, 4.4)
+        self.vy += random.uniform(-2.8, 2.8)
+        self._clamp_velocity(self.max_speed + 3.6)
+        self._ding()
 
     def _start_cursor_heist(self) -> None:
         self.cursor_heist_active = True
@@ -1065,6 +1088,7 @@ class AnnoyingBlockPet:
             and USER32 is not None
             and now >= self.next_mouse_lock_at
             and (not user_active)
+            and now >= self.angry_until
         ):
             # Occasional short mouse lock.
             if random.random() < 0.30:
@@ -1842,9 +1866,7 @@ class AnnoyingBlockPet:
         self.heist_payload_h = 0
         self.heist_editor_text = None
         now = time.monotonic()
-        self.angry_until = max(self.angry_until, now + 3.0)
-        self.cursor_heist_active = True
-        self.cursor_heist_until = max(self.cursor_heist_until, now + 3.0)
+        self.angry_until = max(self.angry_until, now + 5.0)
 
     def _stop_heist(self, destroy_payload: bool = True) -> None:
         was_active = self.heist_active or self.heist_stage != "idle"
