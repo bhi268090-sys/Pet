@@ -12,6 +12,39 @@ from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog
 
+DEFAULT_PROFILE_ID = "cube"
+SETTINGS_FILE_VERSION = 1
+DISCORD_RPC_DEFAULT_CLIENT_ID = "1470109631333404742"
+
+ENV_SOUND = "CUBEPET_SOUND"
+ENV_DEBUG = "CUBEPET_DEBUG"
+ENV_HORROR_GAME = "CUBEPET_HORROR_GAME"
+ENV_STEAL_FOCUS = "CUBEPET_STEAL_FOCUS"
+ENV_RESPECT_INPUT = "CUBEPET_RESPECT_INPUT"
+ENV_ACTIVE_GRACE_S = "CUBEPET_ACTIVE_GRACE_S"
+ENV_NOTIFICATIONS = "CUBEPET_NOTIFICATIONS"
+ENV_DISCORD_RPC = "CUBEPET_DISCORD_RPC"
+ENV_DISCORD_RPC_CLIENT_ID = "CUBEPET_DISCORD_RPC_CLIENT_ID"
+ENV_IMAGE_IDLE_S = "CUBEPET_IMAGE_IDLE_S"
+ENV_IMAGE_MIN_S = "CUBEPET_IMAGE_MIN_S"
+ENV_IMAGE_MAX_S = "CUBEPET_IMAGE_MAX_S"
+ENV_PROFILE = "CUBEPET_PROFILE"
+ENV_SELECT_PET = "CUBEPET_SELECT_PET"
+ENV_HUNGER = "CUBEPET_HUNGER"
+ENV_HUNGER_FULL_S = "CUBEPET_HUNGER_FULL_S"
+ENV_EDITOR_MISCHIEF = "CUBEPET_EDITOR_MISCHIEF"
+
+DEFAULT_ACTIVE_GRACE_S = 1.2
+DEFAULT_IMAGE_IDLE_S = 0.05
+MIN_IMAGE_HEIST_START_S = 2.0
+DEFAULT_IMAGE_MIN_S = 10.0
+DEFAULT_IMAGE_MAX_S = 22.0
+DEFAULT_HUNGER_FULL_S = 900.0
+MIN_HUNGER_FULL_S = 30.0
+
+ENV_TRUE_VALUES = {"1", "true", "TRUE", "yes", "YES", "on", "ON"}
+ENV_FALSE_VALUES = {"0", "false", "FALSE", "no", "NO", "off", "OFF"}
+
 try:
     from PIL import Image, ImageTk, ImageOps  # type: ignore
 
@@ -424,9 +457,9 @@ class AnnoyingBlockPet:
         raw = os.environ.get(name, "").strip()
         if raw == "":
             return default
-        if raw in {"1", "true", "TRUE", "yes", "YES", "on", "ON"}:
+        if raw in ENV_TRUE_VALUES:
             return True
-        if raw in {"0", "false", "FALSE", "no", "NO", "off", "OFF"}:
+        if raw in ENV_FALSE_VALUES:
             return False
         return default
 
@@ -454,8 +487,8 @@ class AnnoyingBlockPet:
     def _save_persistent_settings(self) -> None:
         try:
             data = {
-                "version": 1,
-                "profile_id": getattr(self, "pet_profile_id", "cube"),
+                "version": SETTINGS_FILE_VERSION,
+                "profile_id": getattr(self, "pet_profile_id", DEFAULT_PROFILE_ID),
                 "show_options_on_start": bool(getattr(self, "show_options_on_start", False)),
                 "hunger_enabled": bool(getattr(self, "hunger_enabled", False)),
                 "editor_mischief_enabled": bool(getattr(self, "editor_mischief_enabled", False)),
@@ -466,55 +499,63 @@ class AnnoyingBlockPet:
         except Exception:
             pass
 
+
+    def _apply_optional_env_bool(self, env_name: str, current_value: bool) -> bool:
+        """Return updated bool only when the environment variable is explicitly set."""
+        if os.environ.get(env_name, "").strip() == "":
+            return current_value
+        return self._env_bool(env_name, default=current_value)
+
     def _normalize_profile_id(self, profile_id: str) -> str:
         pid = (profile_id or "").strip().lower()
         if pid in PET_PROFILES:
             return pid
-        return "cube"
+        return DEFAULT_PROFILE_ID
 
     def _load_settings(self) -> None:
+        """Load runtime config from persistent settings + environment overrides."""
         persisted = self._load_persistent_settings()
 
         # Disable Windows "bell" sound spam by default. Set CUBEPET_SOUND=1 to enable.
-        self.sounds_enabled = self._env_bool("CUBEPET_SOUND", default=False)
-        self.debug_enabled = self._env_bool("CUBEPET_DEBUG", default=False)
-        self.horror_game_enabled = self._env_bool("CUBEPET_HORROR_GAME", default=True)
+        self.sounds_enabled = self._env_bool(ENV_SOUND, default=False)
+        self.debug_enabled = self._env_bool(ENV_DEBUG, default=False)
+        self.horror_game_enabled = self._env_bool(ENV_HORROR_GAME, default=True)
 
         # Fix for "typing gets blocked": don't steal focus by default.
         # Old behavior can be re-enabled with CUBEPET_STEAL_FOCUS=1.
-        self.allow_focus_steal = self._env_bool("CUBEPET_STEAL_FOCUS", default=False)
+        self.allow_focus_steal = self._env_bool(ENV_STEAL_FOCUS, default=False)
 
         # When enabled (default), suppress the most disruptive behaviors while the user is actively
         # typing/clicking in other apps. Disable via CUBEPET_RESPECT_INPUT=0.
-        self.respect_user_input = self._env_bool("CUBEPET_RESPECT_INPUT", default=True)
+        self.respect_user_input = self._env_bool(ENV_RESPECT_INPUT, default=True)
 
         # "Recently active" threshold for GetLastInputInfo (seconds).
-        self.active_grace_s = self._env_float("CUBEPET_ACTIVE_GRACE_S", default=1.2)
+        self.active_grace_s = self._env_float(ENV_ACTIVE_GRACE_S, default=DEFAULT_ACTIVE_GRACE_S)
 
         # Optional: Windows notifications / Discord Rich Presence (best-effort, no hard dependency).
         # Notifications are enabled by default. Disable via CUBEPET_NOTIFICATIONS=0.
-        self.notifications_enabled = self._env_bool("CUBEPET_NOTIFICATIONS", default=True)
+        self.notifications_enabled = self._env_bool(ENV_NOTIFICATIONS, default=True)
 
-        self.discord_rpc_enabled = self._env_bool("CUBEPET_DISCORD_RPC", default=False)
+        self.discord_rpc_enabled = self._env_bool(ENV_DISCORD_RPC, default=False)
         # Default to the requested Cupet Discord client ID when the environment
         # variable is not set.
         self.discord_rpc_client_id = os.environ.get(
-            "CUBEPET_DISCORD_RPC_CLIENT_ID", "1470109631333404742"
+            ENV_DISCORD_RPC_CLIENT_ID, DISCORD_RPC_DEFAULT_CLIENT_ID
         ).strip()
 
         # Image heist tuning (this is the prank users notice most).
-        self.image_idle_s = self._env_float("CUBEPET_IMAGE_IDLE_S", default=0.05)
+        self.image_idle_s = self._env_float(ENV_IMAGE_IDLE_S, default=DEFAULT_IMAGE_IDLE_S)
         if self.image_idle_s < 0.0:
             self.image_idle_s = 0.0
-        self.image_min_s = self._env_float("CUBEPET_IMAGE_MIN_S", default=10.0)
-        self.image_max_s = self._env_float("CUBEPET_IMAGE_MAX_S", default=22.0)
-        if self.image_min_s < 2.0:
-            self.image_min_s = 2.0
+        self.image_min_s = self._env_float(ENV_IMAGE_MIN_S, default=DEFAULT_IMAGE_MIN_S)
+        self.image_max_s = self._env_float(ENV_IMAGE_MAX_S, default=DEFAULT_IMAGE_MAX_S)
+        if self.image_min_s < MIN_IMAGE_HEIST_START_S:
+            self.image_min_s = MIN_IMAGE_HEIST_START_S
         if self.image_max_s < self.image_min_s:
             self.image_max_s = self.image_min_s
 
         # Pet profile / feature toggles (safe defaults, persisted values, env overrides).
-        self.pet_profile_id = self._normalize_profile_id(str(persisted.get("profile_id", "cube")))
+        self.pet_profile_id = self._normalize_profile_id(str(persisted.get("profile_id", DEFAULT_PROFILE_ID)))
         self.show_options_on_start = bool(persisted.get("show_options_on_start", False))
         self.hunger_enabled = bool(persisted.get("hunger_enabled", False))
         self.editor_mischief_enabled = bool(persisted.get("editor_mischief_enabled", False))
@@ -524,21 +565,19 @@ class AnnoyingBlockPet:
             self.hunger = 1.0
         self.hunger = max(0.0, min(1.0, self.hunger))
 
-        self.hunger_full_s = self._env_float("CUBEPET_HUNGER_FULL_S", default=900.0)
-        if self.hunger_full_s < 30.0:
-            self.hunger_full_s = 30.0
+        self.hunger_full_s = self._env_float(ENV_HUNGER_FULL_S, default=DEFAULT_HUNGER_FULL_S)
+        if self.hunger_full_s < MIN_HUNGER_FULL_S:
+            self.hunger_full_s = MIN_HUNGER_FULL_S
 
-        env_profile = os.environ.get("CUBEPET_PROFILE", "").strip()
+        env_profile = os.environ.get(ENV_PROFILE, "").strip()
         if env_profile:
             self.pet_profile_id = self._normalize_profile_id(env_profile)
-        if self._env_bool("CUBEPET_SELECT_PET", default=False):
+        if self._env_bool(ENV_SELECT_PET, default=False):
             self.show_options_on_start = True
-        if os.environ.get("CUBEPET_HUNGER", "").strip() != "":
-            self.hunger_enabled = self._env_bool("CUBEPET_HUNGER", default=self.hunger_enabled)
-        if os.environ.get("CUBEPET_EDITOR_MISCHIEF", "").strip() != "":
-            self.editor_mischief_enabled = self._env_bool(
-                "CUBEPET_EDITOR_MISCHIEF", default=self.editor_mischief_enabled
-            )
+        self.hunger_enabled = self._apply_optional_env_bool(ENV_HUNGER, self.hunger_enabled)
+        self.editor_mischief_enabled = self._apply_optional_env_bool(
+            ENV_EDITOR_MISCHIEF, self.editor_mischief_enabled
+        )
 
     def _apply_pet_profile(self, profile_id: str, persist: bool = True) -> None:
         pid = self._normalize_profile_id(profile_id)
