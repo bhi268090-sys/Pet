@@ -1,4 +1,4 @@
-import base6
+import base64
 import json
 import math
 import os
