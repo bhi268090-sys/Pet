@@ -167,6 +167,7 @@ class AnnoyingBlockPet:
 
         self.root = tk.Tk()
         self.root.title("Ultra Nerviger Block")
+        self.root.protocol("WM_DELETE_WINDOW", self._destroy_root)
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
         self.root.configure(bg="black")
@@ -183,6 +184,7 @@ class AnnoyingBlockPet:
         self._discord_rpc = None
         self._discord_rpc_connected = False
         self._last_rpc_update_t = 0.0
+        self._shutting_down = False
 
         # Feeding / "data" memory used for the prank editor typing.
         self.food_tokens: list[str] = []
@@ -453,6 +455,35 @@ class AnnoyingBlockPet:
         except Exception:
             pass
 
+    def _safe_after(self, delay_ms: int, callback) -> str | None:
+        """Schedule callback when Tk is still alive (best-effort)."""
+        if getattr(self, "_shutting_down", False):
+            return None
+        try:
+            if not self.root.winfo_exists():
+                return None
+            return self.root.after(delay_ms, callback)
+        except Exception:
+            return None
+
+    def _destroy_root(self) -> None:
+        if getattr(self, "_shutting_down", False):
+            return
+        self._shutting_down = True
+        try:
+            self._save_persistent_settings()
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_discord_rpc_connected", False):
+                self._shutdown_discord_rpc()
+        except Exception:
+            pass
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
     def _env_bool(self, name: str, default: bool) -> bool:
         raw = os.environ.get(name, "").strip()
         if raw == "":
@@ -689,11 +720,15 @@ class AnnoyingBlockPet:
                 self._save_image_cache(paths)
 
                 def apply() -> None:
+                    if getattr(self, "_shutting_down", False):
+                        self._image_scan_in_progress = False
+                        return
                     self.image_paths = paths
                     self._image_scan_in_progress = False
                     self._log(f"Image scan done: {len(paths)} files.")
 
-                self.root.after(0, apply)
+                if self._safe_after(0, apply) is None:
+                    self._image_scan_in_progress = False
             except Exception:
                 self._image_scan_in_progress = False
                 if self.debug_enabled:
@@ -856,14 +891,14 @@ class AnnoyingBlockPet:
             if getattr(self, "dying", False) and getattr(self, "final_window", None) is not None:
                 self._resurrect_pet()
                 return "break"
-            self.root.destroy()
+            self._destroy_root()
         except Exception:
             pass
         return "break"
 
     def _on_ctrl_shift_q(self, _event=None):
         try:
-            self.root.destroy()
+            self._destroy_root()
         except Exception:
             pass
         return "break"
@@ -4122,17 +4157,32 @@ class AnnoyingBlockPet:
             (Path.home() / "Pictures", 7),
             (Path.home() / "Desktop", 5),
             (Path.home() / "Downloads", 5),
-            (Path.home(), 3),
+            (Path.home(), 2),
         ]
 
         found: list[Path] = []
         seen: set[str] = set()
-        skip_dirs = {"node_modules", "venv", ".git", "__pycache__", "$recycle.bin", "system volume information"}
+        skip_dirs = {
+            "node_modules",
+            "venv",
+            ".venv",
+            ".git",
+            "__pycache__",
+            "$recycle.bin",
+            "system volume information",
+            "appdata",
+            "programdata",
+            "windows",
+        }
+
+        def _walk_error(err) -> None:
+            if self.debug_enabled:
+                self._log(f"Image scan warning: {err}")
 
         for root, max_depth in search_roots:
             if not root.exists():
                 continue
-            for dirpath, dirnames, filenames in os.walk(root):
+            for dirpath, dirnames, filenames in os.walk(root, onerror=_walk_error):
                 rel_depth = len(Path(dirpath).relative_to(root).parts)
                 if rel_depth >= max_depth:
                     dirnames[:] = []
@@ -4155,6 +4205,10 @@ class AnnoyingBlockPet:
                     if len(found) >= max_files:
                         random.shuffle(found)
                         return found
+
+            # Avoid scanning the whole home folder when common folders already gave enough images.
+            if root == Path.home() and len(found) >= max(30, max_files // 3):
+                break
 
         random.shuffle(found)
         return found
