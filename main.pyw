@@ -4,7 +4,7 @@ import math
 import os
 import random
 import re
-import struc
+import struct
 import threading
 import time
 import tkinter as tk
