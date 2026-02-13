@@ -146,6 +146,11 @@ class AnnoyingBlockPet:
         self._fg_cache_proc = ""
 
         self._load_settings()
+        # Starvation "death" state: when hunger reaches 0, the pet becomes inert until revived by feeding a file.
+        try:
+            self.dead = bool(getattr(self, "hunger_enabled", False) and float(getattr(self, "hunger", 1.0)) <= 0.0)
+        except Exception:
+            self.dead = False
         self.pet_profile: PetProfile = PET_PROFILES.get(self.pet_profile_id, PET_PROFILES["cube"])
         self._apply_pet_profile(self.pet_profile_id, persist=False)
         self._discord_rpc = None
@@ -167,6 +172,9 @@ class AnnoyingBlockPet:
         self._opt_hunger_var: tk.BooleanVar | None = None
         self._opt_mischief_var: tk.BooleanVar | None = None
         self._opt_start_var: tk.BooleanVar | None = None
+
+        # Lightweight speech bubble near the pet (used for short messages like "danke" on revive).
+        self.pet_bubble_window: tk.Toplevel | None = None
 
         self.block_size = 94
         self.root.geometry(f"{self.block_size}x{self.block_size}+140+120")
@@ -647,6 +655,8 @@ class AnnoyingBlockPet:
     def _can_start_major_prank(self, now: float, user_active: bool | None = None) -> bool:
         if user_active is None:
             user_active = self._user_is_active()
+        if bool(getattr(self, "dead", False)):
+            return False
         if self.intro_active:
             return False
         if self._dragging or self.ignore_drag_until_release:
@@ -874,6 +884,48 @@ class AnnoyingBlockPet:
             name = "CubePet"
         self._notify(name, message)
 
+    def _hide_pet_bubble(self) -> None:
+        if self.pet_bubble_window is not None and self.pet_bubble_window.winfo_exists():
+            self.pet_bubble_window.destroy()
+        self.pet_bubble_window = None
+
+    def _show_pet_bubble(self, message: str, duration_ms: int = 1800) -> None:
+        # Simple on-screen bubble that doesn't depend on Windows notifications being enabled.
+        self._hide_pet_bubble()
+        try:
+            win = tk.Toplevel(self.root)
+            win.overrideredirect(True)
+            win.attributes("-topmost", True)
+            win.configure(bg="#fff7d6")
+
+            frame = tk.Frame(win, bg="#fff7d6", bd=2, relief="solid")
+            frame.pack(fill="both", expand=True)
+
+            label = tk.Label(
+                frame,
+                text=str(message),
+                bg="#fff7d6",
+                fg="#3b2a0a",
+                font=("Segoe UI", 9, "bold"),
+                padx=10,
+                pady=7,
+            )
+            label.pack()
+
+            win.update_idletasks()
+            px = int(self.x + self.block_size + 10)
+            py = int(self.y + self.block_size // 2 - win.winfo_height() // 2)
+            max_x = max(0, self.screen_w - win.winfo_width())
+            max_y = max(0, self.screen_h - win.winfo_height())
+            px = max(0, min(px, max_x))
+            py = max(0, min(py, max_y))
+            win.geometry(f"+{px}+{py}")
+
+            self.pet_bubble_window = win
+            self.root.after(max(300, int(duration_ms)), self._hide_pet_bubble)
+        except Exception:
+            self._hide_pet_bubble()
+
     def _ding(self) -> None:
         if self.sounds_enabled:
             try:
@@ -913,6 +965,19 @@ class AnnoyingBlockPet:
             or self.cursor_pingpong_active
         ):
             return
+
+        # If the pet is dead, allow click-release to be detected (for revive),
+        # but prevent actual dragging/movement.
+        if bool(getattr(self, "dead", False)):
+            self._dragging = True
+            self.ignore_drag_until_release = False
+            self._drag_offset_x = event.x
+            self._drag_offset_y = event.y
+            self._press_started_at = time.monotonic()
+            self._press_start_root_x = event.x_root
+            self._press_start_root_y = event.y_root
+            self._drag_moved_since_press = False
+            return
         self._stop_heist()
         self.cursor_heist_active = False
         self._dragging = True
@@ -926,6 +991,8 @@ class AnnoyingBlockPet:
 
     def _drag_window(self, event) -> None:
         if self.ignore_drag_until_release:
+            return
+        if bool(getattr(self, "dead", False)):
             return
         if (
             abs(event.x_root - self._press_start_root_x) > 6
@@ -972,7 +1039,8 @@ class AnnoyingBlockPet:
 
     def _run_away_from_mouse(self, event) -> None:
         if (
-            self.intro_active
+            bool(getattr(self, "dead", False))
+            or self.intro_active
             or self.heist_active
             or self.cursor_heist_active
             or self.cursor_pingpong_active
@@ -1003,6 +1071,13 @@ class AnnoyingBlockPet:
         if self.dying:
             return
         now = time.monotonic()
+
+        if bool(getattr(self, "dead", False)):
+            # Corpse: no movement or pranks; keep the loop alive so revive works instantly.
+            self.vx = 0.0
+            self.vy = 0.0
+            self.root.after(80, self._motion_loop)
+            return
 
         if self.intro_active:
             self.vx = 0.0
@@ -1461,6 +1536,9 @@ class AnnoyingBlockPet:
 
     def _on_pet_clicked(self) -> None:
         if self.intro_active:
+            return
+        if bool(getattr(self, "dead", False)):
+            self._revive_from_file_dialog()
             return
         # Left click is used for dragging; keep it as a harmless "poke".
         now = time.monotonic()
@@ -2221,6 +2299,18 @@ class AnnoyingBlockPet:
             return
         self._feed_from_path(Path(chosen))
 
+    def _revive_from_file_dialog(self) -> None:
+        try:
+            chosen = filedialog.askopenfilename(
+                parent=self.root,
+                title="Wiederbeleben: Datei wählen",
+            )
+        except Exception:
+            chosen = ""
+        if not chosen:
+            return
+        self._revive_from_path(Path(chosen))
+
     def _tokens_from_data(self, data: bytes) -> list[str]:
         # Keep tokens short and printable; they will be inserted into the prank editor window.
         try:
@@ -2250,6 +2340,9 @@ class AnnoyingBlockPet:
         return out
 
     def _feed_from_path(self, path: Path) -> None:
+        if bool(getattr(self, "dead", False)):
+            self._revive_from_path(path)
+            return
         try:
             with path.open("rb") as f:
                 sample = f.read(8192)
@@ -2276,6 +2369,42 @@ class AnnoyingBlockPet:
             pass
 
         self._notify_pet(f"Nom nom: {path.name}")
+
+    def _revive_from_path(self, path: Path) -> None:
+        try:
+            with path.open("rb") as f:
+                sample = f.read(8192)
+        except Exception:
+            self._notify_pet("Konnte Datei nicht lesen.")
+            return
+
+        new_tokens = self._tokens_from_data(sample)
+        if new_tokens:
+            self.food_tokens.extend(new_tokens)
+            if len(self.food_tokens) > 900:
+                self.food_tokens = self.food_tokens[-700:]
+
+        self.dead = False
+        if bool(getattr(self, "hunger_enabled", False)):
+            self.hunger = 1.0
+        now = time.monotonic()
+        self.vx = 0.0
+        self.vy = 0.0
+        self.stunned_until = max(self.stunned_until, now + 1.2)
+        self.confused_until = 0.0
+
+        self._save_persistent_settings()
+        try:
+            self._draw_face()
+        except Exception:
+            pass
+        try:
+            self._draw_hud()
+        except Exception:
+            pass
+
+        # Say thanks visibly, even if Windows notifications are disabled.
+        self._show_pet_bubble("danke", duration_ms=1800)
 
     def _show_options_window(self) -> None:
         if self.intro_active:
@@ -2837,6 +2966,11 @@ class AnnoyingBlockPet:
 
         if self.dying:
             return
+        if bool(getattr(self, "dead", False)):
+            self.vx = 0.0
+            self.vy = 0.0
+            self.root.after(900, self._annoy_loop)
+            return
         now = time.monotonic()
         idle_s = self._user_idle_seconds() if self.respect_user_input else 9999.0
         user_active = idle_s < self.active_grace_s
@@ -2955,6 +3089,9 @@ class AnnoyingBlockPet:
     def _hunger_loop(self) -> None:
         if self.dying:
             return
+        if bool(getattr(self, "dead", False)):
+            self.root.after(1200, self._hunger_loop)
+            return
         now = time.monotonic()
         try:
             last = float(getattr(self, "_hunger_last_t", now))
@@ -2981,6 +3118,9 @@ class AnnoyingBlockPet:
             except Exception:
                 pass
 
+            if h <= 0.0 and not bool(getattr(self, "dead", False)):
+                self._die_from_hunger()
+
             # Persist hunger occasionally without spamming disk writes.
             try:
                 last_save = float(getattr(self, "_hunger_last_save_t", 0.0))
@@ -2992,9 +3132,44 @@ class AnnoyingBlockPet:
 
         self.root.after(1200, self._hunger_loop)
 
+    def _die_from_hunger(self) -> None:
+        if bool(getattr(self, "dead", False)):
+            return
+        self.dead = True
+        self.vx = 0.0
+        self.vy = 0.0
+
+        # Stop ongoing activities; corpse should be inert.
+        try:
+            self._stop_heist()
+        except Exception:
+            pass
+        self.cursor_heist_active = False
+        self.cursor_pingpong_active = False
+        self.window_kill_active = False
+        self.mouse_lock_active = False
+        self.close_attack_active = False
+        try:
+            self._destroy_clone()
+        except Exception:
+            pass
+        try:
+            self._hide_pet_bubble()
+        except Exception:
+            pass
+
+        self._save_persistent_settings()
+        try:
+            self._draw_face()
+        except Exception:
+            pass
+
     def _youtube_watch_loop(self) -> None:
         # Checks if the user is currently in a browser on youtube.com and prompts once per "session".
         # A "session" is continuous time while a YouTube tab/window is foreground.
+        if bool(getattr(self, "dead", False)):
+            self.root.after(700, self._youtube_watch_loop)
+            return
         try:
             in_youtube = self._foreground_is_browser_youtube()
         except Exception:
@@ -3024,6 +3199,9 @@ class AnnoyingBlockPet:
 
     def _discord_watch_loop(self) -> None:
         # If Discord is foreground, say it once per "session" (continuous time in foreground).
+        if bool(getattr(self, "dead", False)):
+            self.root.after(800, self._discord_watch_loop)
+            return
         try:
             in_discord = self._foreground_is_discord()
         except Exception:
@@ -4155,6 +4333,8 @@ class AnnoyingBlockPet:
         self.clone_canvas = None
 
     def _update_emotion(self, now: float) -> None:
+        if bool(getattr(self, "dead", False)):
+            return
         target = "frech"
         if now < self.angry_until or self.close_attack_active or self.cursor_heist_active or self.window_kill_active:
             target = "mad"
@@ -4169,6 +4349,31 @@ class AnnoyingBlockPet:
 
     def _draw_face(self) -> None:
         self.block.delete("face")
+
+        if bool(getattr(self, "dead", False)):
+            try:
+                self.block.delete("hud")
+            except Exception:
+                pass
+            image = self.face_assets.get("dead")
+            if image is None:
+                self.block.create_text(
+                    self.block_size // 2,
+                    self.block_size // 2,
+                    text="RIP",
+                    fill="#f0f0f0",
+                    font=("Segoe UI", 12, "bold"),
+                    tags="face",
+                )
+            else:
+                self.block.create_image(
+                    self.block_size // 2,
+                    self.block_size // 2,
+                    image=image,
+                    tags="face",
+                )
+            # Hide HUD while dead to keep the visual clean.
+            return
         key = "frech"
         
         if self.emotion == "scary":
@@ -4308,6 +4513,7 @@ class AnnoyingBlockPet:
             "silly": "Silly_Bild.png",
             "confused": "Verwirrt_Bild.png",
             "mad": "Wutend_Bild.png",
+            "dead": "dead_pet.jpg",
         }
         loaded: dict[str, object] = {}
         for key, filename in files.items():
@@ -4321,6 +4527,10 @@ class AnnoyingBlockPet:
             return None
         target = max(24, self.block_size - 4)
         try:
+            if (path.suffix or "").lower() in {".jpg", ".jpeg"} and not PIL_AVAILABLE:
+                # Tk's PhotoImage can't load JPEG; without PIL we can't show this asset.
+                self._log_once("jpeg_face_no_pil", "JPEG face asset present but PIL is unavailable; skipping.")
+                return None
             if PIL_AVAILABLE:
                 with Image.open(path) as _im:  # type: ignore[name-defined]
                     pil = ImageOps.exif_transpose(_im)  # type: ignore[name-defined]
