@@ -1,0 +1,14 @@
+{
+  "clones_enabled": true,
+  "cursor_games_enabled": true,
+  "editor_heist_enabled": true,
+  "editor_mischief_enabled": true,
+  "hunger": 0.8112154268888887,
+  "hunger_enabled": true,
+  "image_heist_enabled": true,
+  "mouse_lock_enabled": true,
+  "profile_id": "cube",
+  "show_options_on_start": false,
+  "version": 2,
+  "window_kill_enabled": true
+}
