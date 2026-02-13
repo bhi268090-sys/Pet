@@ -5,7 +5,7 @@ a = Analysis(
     ['main.pyw'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('Frech_Birld.png', '.'), ('Silly_Bild.png', '.'), ('Verwirrt_Bild.png', '.'), ('Wutend_Bild.png', '.'), ('dead_pet.jpg', '.'), ('Frech_Birld.ico', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
