@@ -1,4 +1,4 @@
-﻿import base64
+import base64
 import json
 import math
 import os
@@ -2213,7 +2213,7 @@ class AnnoyingBlockPet:
         try:
             chosen = filedialog.askopenfilename(
                 parent=self.root,
-                title="Fuettern mit Daten: Datei waehlen",
+                title="Füttern mit Daten: Datei wählen",
             )
         except Exception:
             chosen = ""
@@ -2557,7 +2557,7 @@ class AnnoyingBlockPet:
         actions.pack(fill="x", padx=10, pady=(0, 10))
         tk.Button(
             actions,
-            text="Fuettern (Datei...)",
+            text="Füttern (Datei...)",
             command=self._feed_from_file_dialog,
             bg="#ffffff",
             fg="#0f172a",
